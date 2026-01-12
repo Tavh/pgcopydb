@@ -399,6 +399,7 @@ typedef struct PreparedStmt
 {
 	uint32_t hash;
 	bool prepared;
+	bool filterOut;
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } PreparedStmt;

@@ -1037,15 +1037,6 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_UPDATE:
 		case STREAM_ACTION_DELETE:
 		{
-			/* Skip filtered out statements */
-			if (metadata->filterOut)
-			{
-				log_trace("Skipping filtered %s statement",
-						  metadata->action == STREAM_ACTION_INSERT ? "INSERT" :
-						  metadata->action == STREAM_ACTION_UPDATE ? "UPDATE" : "DELETE");
-				return true;
-			}
-
 			/*
 			 * We still allow continuedTxn, COMMIT message determines whether
 			 * to keep the transaction or abort it.
@@ -1063,18 +1054,33 @@ stream_apply_sql(StreamApplyContext *context,
 
 			if (stmt == NULL)
 			{
-				char name[NAMEDATALEN] = { 0 };
-				sformat(name, sizeof(name), "%x", metadata->hash);
-
-				if (!pgsql_prepare(applyPgConn, name, metadata->stmt, 0, NULL))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-
+				/* Add to hash table even if filtered, so EXECUTE can find it */
 				stmt = (PreparedStmt *) calloc(1, sizeof(PreparedStmt));
 				stmt->hash = hash;
-				stmt->prepared = true;
+				stmt->filterOut = metadata->filterOut;
+				stmt->prepared = false;
+
+				/* Only actually prepare the statement if not filtered */
+				if (!metadata->filterOut)
+				{
+					char name[NAMEDATALEN] = { 0 };
+					sformat(name, sizeof(name), "%x", metadata->hash);
+
+					if (!pgsql_prepare(applyPgConn, name, metadata->stmt, 0, NULL))
+					{
+						/* errors have already been logged */
+						return false;
+					}
+
+					stmt->prepared = true;
+				}
+				else
+				{
+					log_trace("Skipping filtered %s statement in PREPARE",
+							  metadata->action == STREAM_ACTION_INSERT ? "INSERT" :
+							  metadata->action == STREAM_ACTION_UPDATE ? "UPDATE" :
+							  "DELETE");
+				}
 
 				HASH_ADD(hh, stmtHashTable, hash, sizeof(hash), stmt);
 
@@ -1087,13 +1093,6 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_EXECUTE:
 		{
-			/* Skip filtered out statements - check if corresponding PREPARE was filtered */
-			if (metadata->filterOut)
-			{
-				log_trace("Skipping filtered EXECUTE statement");
-				return true;
-			}
-
 			/*
 			 * We still allow continuedTxn, COMMIT message determines whether
 			 * to keep the transaction or abort it.
@@ -1113,6 +1112,13 @@ stream_apply_sql(StreamApplyContext *context,
 			{
 				log_warn("BUG: Failed to find statement %x in stmtHashTable",
 						 hash);
+			}
+
+			/* Skip filtered out statements - check if corresponding PREPARE was filtered */
+			if (stmt != NULL && stmt->filterOut)
+			{
+				log_trace("Skipping filtered EXECUTE statement");
+				return true;
 			}
 
 			char name[NAMEDATALEN] = { 0 };

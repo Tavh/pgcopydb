@@ -12,6 +12,9 @@
      --no-acl             Prevent restoration of access privileges (grant/revoke commands).
      --no-comments        Do not output commands to restore comments
      --no-tablespaces     Do not output commands to select tablespaces
+     --skip-extensions    Skip restoring extensions
+     --skip-ext-comments  Skip restoring COMMENT ON EXTENSION
+     --skip-publications  Skip restoring publications
      --filters <filename> Use the filters defined in <filename>
      --restart            Allow restarting when temp files exist already
      --resume             Allow resuming operations after a failure

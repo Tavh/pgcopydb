@@ -5026,7 +5026,8 @@ catalog_iter_s_seq_finish(SourceSeqIterator *iter)
 bool
 catalog_prepare_filter(DatabaseCatalog *catalog,
 					   bool skipExtensions,
-					   bool skipCollations)
+					   bool skipCollations,
+					   bool skipPublications)
 {
 	sqlite3 *db = catalog->db;
 
@@ -5198,6 +5199,30 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 			"      from s_coll ";
 
 		if (!catalog_sql_prepare(db, s_coll_sql, &query))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		/* now execute the query, which does not return any row */
+		if (!catalog_sql_execute_once(&query))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	/*
+	 * Implement --skip-publications
+	 */
+	if (skipPublications)
+	{
+		char *s_publication_sql =
+			"insert or ignore into filter(oid, restore_list_name, kind) "
+			"    select oid, restore_list_name, 'publication' "
+			"      from s_publication ";
+
+		if (!catalog_sql_prepare(db, s_publication_sql, &query))
 		{
 			/* errors have already been logged */
 			return false;

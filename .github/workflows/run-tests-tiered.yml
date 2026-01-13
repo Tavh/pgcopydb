@@ -142,6 +142,7 @@ jobs:
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-between-transaction
+          - cdc-filtering
           - cdc-wal2json
           - follow-wal2json
           - follow-9.6

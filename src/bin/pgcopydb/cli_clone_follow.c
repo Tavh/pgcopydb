@@ -197,23 +197,6 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	StreamSpecs streamSpecs = { 0 };
 
 	/*
-	 * Open the source catalog and register/load setup information including
-	 * filters. This ensures filters are available for the apply process,
-	 * even when resuming without --filters option.
-	 */
-	if (!catalog_open_from_specs(copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	if (!catalog_register_setup_from_specs(copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	/*
 	 * Refrain from logging SQL statements in the apply module, because they
 	 * contain user data. That said, when --trace has been used, bypass that
 	 * privacy feature.
@@ -389,23 +372,6 @@ cli_follow(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
-
-	/*
-	 * Open the source catalog and register/load setup information including
-	 * filters. This ensures filters are available for the apply process,
-	 * even when resuming without --filters option.
-	 */
-	if (!catalog_open_from_specs(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	if (!catalog_register_setup_from_specs(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
 
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they

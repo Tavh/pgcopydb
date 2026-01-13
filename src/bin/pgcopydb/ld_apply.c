@@ -55,6 +55,10 @@ static bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir
 
 static bool setupConnection(PGSQL *pgsql, StreamApplyContext *context);
 
+static bool extractTableNameFromPrepare(const char *stmt,
+										char *nspname, size_t nspnameSize,
+										char *relname, size_t relnameSize);
+
 /*
  * stream_apply_catchup catches up with SQL files that have been prepared by
  * either the `pgcopydb stream prefetch` command.
@@ -1037,15 +1041,6 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_UPDATE:
 		case STREAM_ACTION_DELETE:
 		{
-			/* Skip filtered out statements */
-			if (metadata->filterOut)
-			{
-				log_trace("Skipping filtered %s statement",
-						  metadata->action == STREAM_ACTION_INSERT ? "INSERT" :
-						  metadata->action == STREAM_ACTION_UPDATE ? "UPDATE" : "DELETE");
-				return true;
-			}
-
 			/*
 			 * We still allow continuedTxn, COMMIT message determines whether
 			 * to keep the transaction or abort it.
@@ -1063,6 +1058,44 @@ stream_apply_sql(StreamApplyContext *context,
 
 			if (stmt == NULL)
 			{
+				/* Add to hash table even if filtered, so EXECUTE can find it */
+				stmt = (PreparedStmt *) calloc(1, sizeof(PreparedStmt));
+				stmt->hash = hash;
+				stmt->filterOut = metadata->filterOut;
+				stmt->prepared = false;
+
+				/* Extract and store schema.table name for logging and tracking */
+				char nspname[PG_NAMEDATALEN] = { 0 };
+				char relname[PG_NAMEDATALEN] = { 0 };
+
+				if (extractTableNameFromPrepare(metadata->stmt,
+												nspname, sizeof(nspname),
+												relname, sizeof(relname)))
+				{
+					strlcpy(stmt->nspname, nspname, sizeof(stmt->nspname));
+					strlcpy(stmt->relname, relname, sizeof(stmt->relname));
+				}
+
+				HASH_ADD(hh, stmtHashTable, hash, sizeof(hash), stmt);
+
+				/* HASH_ADD can change the pointer in place, update */
+				context->preparedStmt = stmtHashTable;
+			}
+
+			/* Skip filtered statements - don't prepare or execute them */
+			if (stmt != NULL && stmt->filterOut)
+			{
+				log_trace("Skipping filtered %s statement",
+						  metadata->action == STREAM_ACTION_INSERT ? "INSERT" :
+						  metadata->action == STREAM_ACTION_UPDATE ? "UPDATE" :
+						  "DELETE");
+				return true;
+			}
+
+			/* Only prepare if we haven't already */
+			if (stmt != NULL && !stmt->prepared)
+			{
+				/* Prepare the statement for later execution */
 				char name[NAMEDATALEN] = { 0 };
 				sformat(name, sizeof(name), "%x", metadata->hash);
 
@@ -1072,14 +1105,7 @@ stream_apply_sql(StreamApplyContext *context,
 					return false;
 				}
 
-				stmt = (PreparedStmt *) calloc(1, sizeof(PreparedStmt));
-				stmt->hash = hash;
 				stmt->prepared = true;
-
-				HASH_ADD(hh, stmtHashTable, hash, sizeof(hash), stmt);
-
-				/* HASH_ADD can change the pointer in place, update */
-				context->preparedStmt = stmtHashTable;
 			}
 
 			break;
@@ -1087,13 +1113,6 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_EXECUTE:
 		{
-			/* Skip filtered out statements - check if corresponding PREPARE was filtered */
-			if (metadata->filterOut)
-			{
-				log_trace("Skipping filtered EXECUTE statement");
-				return true;
-			}
-
 			/*
 			 * We still allow continuedTxn, COMMIT message determines whether
 			 * to keep the transaction or abort it.
@@ -1113,6 +1132,14 @@ stream_apply_sql(StreamApplyContext *context,
 			{
 				log_warn("BUG: Failed to find statement %x in stmtHashTable",
 						 hash);
+			}
+
+			/* Skip filtered out statements - check if corresponding PREPARE was filtered */
+			if (stmt != NULL && stmt->filterOut)
+			{
+				log_trace("Skipping filtered EXECUTE statement for %s.%s",
+						  stmt->nspname, stmt->relname);
+				return true;
 			}
 
 			char name[NAMEDATALEN] = { 0 };
@@ -1630,6 +1657,38 @@ shouldFilterOutTable(const char *nspname, const char *relname,
 	if (filters == NULL)
 	{
 		return false;
+	}
+
+	/* Check exclude-schema filter */
+	for (int i = 0; i < filters->excludeSchemaList.count; i++)
+	{
+		if (strcmp(filters->excludeSchemaList.array[i].nspname, nspname) == 0)
+		{
+			log_trace("Filtering out table \"%s\".\"%s\" (schema in exclude-schema list)",
+					  nspname, relname);
+			return true;
+		}
+	}
+
+	/* Check include-only-schema filter */
+	if (filters->includeOnlySchemaList.count > 0)
+	{
+		bool found = false;
+		for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
+		{
+			if (strcmp(filters->includeOnlySchemaList.array[i].nspname, nspname) == 0)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			log_trace(
+				"Filtering out table \"%s\".\"%s\" (schema not in include-only-schema list)",
+				nspname, relname);
+			return true;
+		}
 	}
 
 	/* Check include-only-table filter */

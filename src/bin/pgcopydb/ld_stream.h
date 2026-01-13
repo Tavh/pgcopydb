@@ -400,6 +400,8 @@ typedef struct PreparedStmt
 	uint32_t hash;
 	bool prepared;
 	bool filterOut;
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } PreparedStmt;

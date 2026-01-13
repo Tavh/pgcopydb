@@ -804,6 +804,21 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 						 "see above for details",
 						 sourceDB->dbfile);
 				log_warn("Using previously configured filters");
+
+				/* Load the filters from the catalog into copySpecs */
+				log_info("Loading filters from catalog JSON: %s", setup->filters);
+
+				if (!filters_from_json(setup->filters, filters))
+				{
+					log_error("Failed to parse filters from catalog: %s",
+							  setup->filters);
+					return false;
+				}
+
+				log_info(
+					"Successfully loaded filters from catalog: type=%s, exclude-schema count=%d",
+					filterTypeToString(filters->type),
+					filters->excludeSchemaList.count);
 			}
 			else
 			{
@@ -816,6 +831,35 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 				return false;
 			}
 		}
+	}
+
+	/* Always ensure filters are loaded from catalog if they exist and current
+	 * command doesn't have filters. This handles cases where subsequent commands
+	 * (like stream catchup) reuse an already-initialized catalog.
+	 */
+	CatalogSetup *setup = &(sourceDB->setup);
+
+	log_debug("Post-mismatch check: setup->filters=%s, filters->type=%s",
+			  setup->filters ? setup->filters : "NULL",
+			  filterTypeToString(filters->type));
+
+	if (setup->filters != NULL &&
+		strstr(setup->filters, "SOURCE_FILTER_TYPE_NONE") == NULL &&
+		filters->type == SOURCE_FILTER_TYPE_NONE)
+	{
+		log_info("Loading filters from catalog for reused setup");
+
+		if (!filters_from_json(setup->filters, filters))
+		{
+			log_error("Failed to parse filters from catalog: %s",
+					  setup->filters);
+			json_free_serialized_string(json);
+			return false;
+		}
+
+		log_info("Loaded filters from catalog: type=%s, exclude-schema count=%d",
+				 filterTypeToString(filters->type),
+				 filters->excludeSchemaList.count);
 	}
 
 	json_free_serialized_string(json);

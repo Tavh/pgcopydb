@@ -5257,28 +5257,11 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	}
 
 	/*
-	 * Implement --skip-publications
+	 * Note: --skip-publications is implemented in dump_restore.c by filtering
+	 * publications from the pg_restore list. We don't need to filter them
+	 * here in the catalog because publications are not fetched into the
+	 * internal catalog.
 	 */
-	if (skipPublications)
-	{
-		char *s_publication_sql =
-			"insert or ignore into filter(oid, restore_list_name, kind) "
-			"    select oid, restore_list_name, 'publication' "
-			"      from s_publication ";
-
-		if (!catalog_sql_prepare(db, s_publication_sql, &query))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		/* now execute the query, which does not return any row */
-		if (!catalog_sql_execute_once(&query))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
 
 	return true;
 }

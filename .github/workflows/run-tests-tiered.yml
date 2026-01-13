@@ -139,6 +139,7 @@ jobs:
           - filtering
           - extensions
           - timescaledb
+          - skip-publications
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-between-transaction

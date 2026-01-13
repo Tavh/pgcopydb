@@ -140,6 +140,8 @@ jobs:
           - extensions
           - timescaledb
           - skip-publications
+          - skip-vacuum
+          - skip-large-objects
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-between-transaction

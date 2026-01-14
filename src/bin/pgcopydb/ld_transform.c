@@ -1348,9 +1348,10 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 		case STREAM_ACTION_MESSAGE:
 		{
 			log_debug("Skipping generic message at LSN %X/%X (prefix: %s)",
-			          LSN_FORMAT_ARGS(metadata->lsn),
+					  LSN_FORMAT_ARGS(metadata->lsn),
+
 			          /* Note: would need to parse message.prefix from JSON for full info */
-			          mesg->isTransaction ? "transactional" : "non-transactional");
+					  mesg->isTransaction ? "transactional" : "non-transactional");
 
 			/* Return true to indicate successful processing (by skipping) */
 			return true;

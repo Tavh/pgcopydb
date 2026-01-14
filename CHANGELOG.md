@@ -11,6 +11,7 @@
 * Fix transaction state management for `clone --follow --snapshot` workflows
 * Make catalog_attach() idempotent to prevent concurrent process conflicts
 * Tolerate minor pg_restore errors during schema restoration - pgcopydb now continues when pg_restore exits with code 1 but reports "errors ignored on restore: N" where N ≤ 10 (configurable via MAX_TOLERATED_RESTORE_ERRORS). This allows migrations to proceed through minor extension version mismatches (e.g., PostGIS 3.1.5 → 3.5.3) that don't affect data integrity.
+* Filter generic messages from other CDC tools (PeerDB, Debezium, etc.) to prevent "Failed to parse action M" errors during migrations. Messages are filtered at the wal2json protocol level and also handled gracefully in the transform phase for backward compatibility. This allows pgcopydb to run alongside other logical replication tools without requiring them to be stopped.
 
 ### pgcopydb v0.17 (August 7, 2024) ###
 

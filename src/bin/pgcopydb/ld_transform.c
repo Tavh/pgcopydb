@@ -1331,6 +1331,31 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 			break;
 		}
 
+		/*
+		 * Generic messages (action 'M') from pg_logical_emit_message()
+		 *
+		 * These are not data changes - typically heartbeats or monitoring signals
+		 * from other CDC tools (PeerDB, Debezium, etc.) running on the source.
+		 *
+		 * As of [version], we filter these at the source using wal2json's
+		 * add-msg-prefixes option. However, this handler remains for:
+		 * 1. Existing JSON files from runs before the wal2json filter was added
+		 * 2. Graceful handling if wal2json behavior changes
+		 * 3. Support for test_decoding plugin (which doesn't support add-msg-prefixes)
+		 *
+		 * We skip them because they're not business data and are tool-specific.
+		 */
+		case STREAM_ACTION_MESSAGE:
+		{
+			log_debug("Skipping generic message at LSN %X/%X (prefix: %s)",
+			          LSN_FORMAT_ARGS(metadata->lsn),
+			          /* Note: would need to parse message.prefix from JSON for full info */
+			          mesg->isTransaction ? "transactional" : "non-transactional");
+
+			/* Return true to indicate successful processing (by skipping) */
+			return true;
+		}
+
 		/* now handle DML messages from the output plugin */
 		default:
 		{

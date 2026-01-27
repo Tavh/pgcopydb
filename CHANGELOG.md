@@ -3,6 +3,10 @@
 ### Added
 * Support for PostgreSQL 17 and 18
 * New `--skip-publications` flag allows migrations to proceed when publications already exist on the source database or need to be managed separately
+* New `pgcopydb list views` command to list all views from the source database
+* New `pgcopydb list triggers` command to list all triggers from the source database with schema and table details
+* Enhanced failure reporting: When migrations fail, pgcopydb now displays a detailed summary showing completed phases, failure location, progress within the failed phase, and resource counts (tables, indexes, constraints, sequences, views, triggers)
+* Views and triggers are now tracked in internal SQLite catalogs and included in migration summaries
 
 ### Fixed
 

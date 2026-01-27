@@ -582,6 +582,30 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 		}
 	}
 
+	/* fetch the list of views for visibility and tracking */
+	if (specs->section == DATA_SECTION_ALL ||
+		specs->section == DATA_SECTION_SCHEMA)
+	{
+		log_debug("Fetching list of views from source database");
+
+		if (!schema_list_views(src, &(specs->filters), sourceDB))
+		{
+			log_info("Failed to list views, continuing without view tracking");
+		}
+	}
+
+	/* fetch the list of triggers for visibility and tracking */
+	if (specs->section == DATA_SECTION_ALL ||
+		specs->section == DATA_SECTION_SCHEMA)
+	{
+		log_debug("Fetching list of triggers from source database");
+
+		if (!schema_list_triggers(src, &(specs->filters), sourceDB))
+		{
+			log_info("Failed to list triggers, continuing without trigger tracking");
+		}
+	}
+
 	if ((specs->section == DATA_SECTION_ALL ||
 		 specs->section == DATA_SECTION_SCHEMA ||
 		 specs->section == DATA_SECTION_NAMESPACES) &&

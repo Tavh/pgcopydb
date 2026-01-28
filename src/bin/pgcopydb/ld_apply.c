@@ -1649,6 +1649,10 @@ extractTableNameFromPrepare(const char *stmt,
 /*
  * shouldFilterOutTable checks if a given table should be filtered out based
  * on the configured filters.
+ *
+ * Note: This function checks in-memory filter lists. For extension filtering
+ * during CDC, we also need to check the catalog filter table (see usage in
+ * parseSQLAction where we pass the catalog context).
  */
 static bool
 shouldFilterOutTable(const char *nspname, const char *relname,

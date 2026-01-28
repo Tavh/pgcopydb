@@ -225,6 +225,15 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 	PGSQL *src = context->src;
 	PGSQL *dst = context->dst;
 
+	/* Check if extension is filtered out */
+	CatalogFilter filter = { 0 };
+
+	if (catalog_lookup_filter_by_oid(context->filtersDB, &filter, ext->oid))
+	{
+		log_info("Skipping filtered extension \"%s\"", ext->extname);
+		return true;
+	}
+
 	if (context->createExtensions)
 	{
 		PQExpBuffer sql = createPQExpBuffer();

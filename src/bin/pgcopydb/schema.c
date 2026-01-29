@@ -3046,6 +3046,50 @@ struct FilteringQueries listSourceDependSQL[] = {
 		/* remove duplicates due to multiple refobjsubid / objsubid */
 		"GROUP BY n.nspname, c.relname, "
 		"         refclassid, refobjid, classid, objid, deptype, type, identity"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_EXCL_INDEX,
+		""
+	},
+
+	{
+		SOURCE_FILTER_TYPE_LIST_EXCL_INDEX,
+		""
+	},
+
+	{
+		SOURCE_FILTER_TYPE_EXCL_EXTENSION,
+
+		PG_DEPEND_SQL
+		"  SELECT '' as nspname, '' as relname, "
+		"         refclassid, refobjid, classid, objid, "
+		"         deptype, type, identity "
+		"    FROM unconcat "
+		"         , pg_identify_object(classid, objid, objsubid) "
+		"   WHERE deptype = 'e' "
+		"     AND refclassid = 'pg_extension'::regclass "
+		"     AND NOT (refclassid = classid AND refobjid = objid) "
+
+		/* remove duplicates due to multiple refobjsubid / objsubid */
+		"GROUP BY refclassid, refobjid, classid, objid, deptype, type, identity"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_LIST_EXCL_EXTENSION,
+
+		PG_DEPEND_SQL
+		"  SELECT '' as nspname, '' as relname, "
+		"         refclassid, refobjid, classid, objid, "
+		"         deptype, type, identity "
+		"    FROM unconcat "
+		"         , pg_identify_object(classid, objid, objsubid) "
+		"   WHERE deptype = 'e' "
+		"     AND refclassid = 'pg_extension'::regclass "
+		"     AND NOT (refclassid = classid AND refobjid = objid) "
+
+		/* remove duplicates due to multiple refobjsubid / objsubid */
+		"GROUP BY refclassid, refobjid, classid, objid, deptype, type, identity"
 	}
 };
 
@@ -3091,6 +3135,18 @@ schema_list_pg_depend(PGSQL *pgsql,
 		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
 		{
 			return true;
+		}
+
+		/*
+		 * For extension filtering, we need pg_depend data to identify
+		 * extension-owned objects. Fetch extension dependencies without
+		 * using prepareFilters since we don't need temp tables.
+		 */
+		case SOURCE_FILTER_TYPE_EXCL_EXTENSION:
+		case SOURCE_FILTER_TYPE_LIST_EXCL_EXTENSION:
+		{
+			/* No prepareFilters needed - SQL doesn't use temp tables */
+			break;
 		}
 
 		default:

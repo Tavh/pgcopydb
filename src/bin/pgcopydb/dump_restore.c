@@ -33,6 +33,9 @@ static bool copydb_copy_database_properties_hook(void *ctx,
 static bool copydb_write_restore_list_hook(void *ctx,
 										   ArchiveContentItem *item);
 
+static bool copydb_acl_is_filtered_out(CopyDataSpec *specs,
+									   ArchiveContentItem *item);
+
 
 /*
  * copydb_objectid_has_been_processed_already returns true when the given
@@ -825,6 +828,25 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 				   item->restoreListName);
 	}
 
+	/*
+	 * Filter ACLs for extension-owned objects.
+	 * ACL entries have objectOid=0, so we check by schema name instead.
+	 */
+	if (!skip &&
+		item->isCompositeTag &&
+		item->tagKind == ARCHIVE_TAG_KIND_ACL &&
+		item->objectOid == 0)
+	{
+		if (copydb_acl_is_filtered_out(specs, item))
+		{
+			skip = true;
+
+			log_notice("Skipping ACL for extension-owned object: %s %s",
+					   item->description,
+					   item->restoreListName);
+		}
+	}
+
 	PQExpBuffer buf = createPQExpBuffer();
 
 	printfPQExpBuffer(buf, "%s%d; %u %u %s %s\n",
@@ -853,4 +875,63 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 	destroyPQExpBuffer(buf);
 
 	return true;
+}
+
+
+/*
+ * copydb_acl_is_filtered_out checks if an ACL statement references an
+ * extension-owned object by looking up the schema name in the filter table.
+ *
+ * ACL entries have objectOid=0, so we can't filter by OID. Instead, we:
+ * 1. Extract schema name from restore list name (e.g., "rds_tools" or "rds_tools.func")
+ * 2. Check if schema belongs to a filtered extension by looking it up in filter table
+ */
+static bool
+copydb_acl_is_filtered_out(CopyDataSpec *specs, ArchiveContentItem *item)
+{
+	DatabaseCatalog *filtersDB = &(specs->catalogs.filter);
+	char *restoreListName = item->restoreListName;
+
+	/* Extract schema name from restore list name */
+	char schema[PG_NAMEDATALEN] = { 0 };
+	char *dot = strchr(restoreListName, '.');
+
+	if (dot != NULL)
+	{
+		/* Format: "schema.object" - extract schema part */
+		size_t len = dot - restoreListName;
+		if (len >= PG_NAMEDATALEN)
+		{
+			len = PG_NAMEDATALEN - 1;
+		}
+		strlcpy(schema, restoreListName, len + 1);
+	}
+	else
+	{
+		/* Format: "schema" - use as-is */
+		strlcpy(schema, restoreListName, sizeof(schema));
+	}
+
+	/*
+	 * Check if this schema belongs to a filtered extension.
+	 * The catalog.c code already populated the filter table with
+	 * extension-owned objects marked as kind='extension-object'.
+	 * We check if our schema name matches any of those filtered objects.
+	 */
+	CatalogFilter result = { 0 };
+
+	if (!catalog_lookup_filter_by_rlname(filtersDB, &result, schema))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* If we found a match in the filter table, skip this ACL */
+	if (!IS_EMPTY_STRING_BUFFER(result.restoreListName))
+	{
+		log_debug("ACL filtered for extension-owned schema: %s", schema);
+		return true;
+	}
+
+	return false;
 }

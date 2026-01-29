@@ -5660,14 +5660,18 @@ getDependArray(void *ctx, PGresult *result)
 			break;
 		}
 
-		if (context->catalog != NULL && context->catalog->db != NULL)
+		if (context->catalog == NULL || context->catalog->db == NULL)
 		{
-			if (!catalog_add_s_depend(context->catalog, depend))
-			{
-				/* errors have already been logged */
-				parsedOk = false;
-				break;
-			}
+			log_error("BUG: getDependArray called with NULL catalog database");
+			parsedOk = false;
+			break;
+		}
+
+		if (!catalog_add_s_depend(context->catalog, depend))
+		{
+			/* errors have already been logged */
+			parsedOk = false;
+			break;
 		}
 	}
 

@@ -892,6 +892,12 @@ copydb_acl_is_filtered_out(CopyDataSpec *specs, ArchiveContentItem *item)
 	DatabaseCatalog *filtersDB = &(specs->catalogs.filter);
 	char *restoreListName = item->restoreListName;
 
+	/* Safety check: if restoreListName is NULL, we can't filter by name */
+	if (restoreListName == NULL)
+	{
+		return false;
+	}
+
 	/* Extract schema name from restore list name */
 	char schema[PG_NAMEDATALEN] = { 0 };
 	char *dot = strchr(restoreListName, '.');

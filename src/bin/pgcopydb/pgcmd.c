@@ -1759,13 +1759,11 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 	 * Check if this starts with "- " prefix or not.
 	 */
 	ArchiveToken checkToken = { .ptr = ptr };
-	bool hasDashPrefix = false;
 
 	if (tokenize_archive_list_entry(&checkToken) &&
 		checkToken.type == ARCHIVE_TOKEN_DASH)
 	{
 		/* Has "- " prefix - parse it normally */
-		hasDashPrefix = true;
 
 		if (!tokenize_archive_list_entry(&token) ||
 			token.type != ARCHIVE_TOKEN_DASH)
@@ -1838,8 +1836,8 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 			return false;
 		}
 
-		memcpy(item->restoreListName, schemaStart, schemaLen);
-		item->restoreListName[schemaLen] = '\0';
+		sformat(item->restoreListName, schemaLen + 1, "%.*s",
+				schemaLen, schemaStart);
 
 		log_info("ACL: extracted schema '%s' from FUNCTION/TYPE/TABLE ACL",
 				 item->restoreListName);
@@ -1964,8 +1962,8 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 
 			if (item->restoreListName != NULL)
 			{
-				memcpy(item->restoreListName, schemaStart, schemaLen);
-				item->restoreListName[schemaLen] = '\0';
+				sformat(item->restoreListName, schemaLen + 1, "%.*s",
+						schemaLen, schemaStart);
 
 				log_info("ACL: extracted schema '%s' for filtering",
 						 item->restoreListName);

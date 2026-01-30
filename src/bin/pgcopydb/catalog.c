@@ -5892,8 +5892,24 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 	/*
 	 * In some cases with sequences we might want to skip adding a dependency
 	 * in our hash table here. See the previous discussion for details.
+	 *
+	 * When extension filtering is active, exclude extension dependencies
+	 * (deptype='e') because they will be inserted separately with
+	 * kind='extension-object' later.
 	 */
+	bool hasExtensionFilters = (filters != NULL) &&
+							   (filters->excludeExtensionList.count > 0 ||
+								filters->includeOnlyExtensionList.count > 0);
+
 	char *s_depend_sql =
+		hasExtensionFilters ?
+		"insert or ignore into filter(oid, restore_list_name, kind) "
+		"     select distinct objid, identity as restore_list_name, 'pg_depend' "
+		"       from s_depend d "
+		"      where not exists"
+		"            (select 1 from source.s_seq ss where ss.oid = d.objid) "
+		"        and d.deptype != 'e' "  /* Exclude extension dependencies */
+		:
 		"insert or ignore into filter(oid, restore_list_name, kind) "
 		"     select distinct objid, identity as restore_list_name, 'pg_depend' "
 		"       from s_depend d "

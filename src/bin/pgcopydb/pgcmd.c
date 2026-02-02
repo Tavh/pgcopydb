@@ -1554,7 +1554,8 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	 * 4840; 0 0 COMMENT - EXTENSION postgis
 	 */
 	if (item->desc == ARCHIVE_TAG_ACL ||
-		item->desc == ARCHIVE_TAG_COMMENT)
+		item->desc == ARCHIVE_TAG_COMMENT ||
+		item->desc == ARCHIVE_TAG_DEFAULT_ACL)
 	{
 		item->isCompositeTag = true;
 
@@ -1566,6 +1567,11 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 		else if (item->desc == ARCHIVE_TAG_COMMENT)
 		{
 			item->tagKind = ARCHIVE_TAG_KIND_COMMENT;
+		}
+		else if (item->desc == ARCHIVE_TAG_DEFAULT_ACL)
+		{
+			/* Treat DEFAULT ACL as ACL for filtering purposes */
+			item->tagKind = ARCHIVE_TAG_KIND_ACL;
 		}
 
 		/* ignore errors, that's stuff we don't support yet (no need to) */
@@ -1935,6 +1941,46 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 		/* an extension's pg_restore list name is just its name */
 		sformat(item->restoreListName, bytes, "%s", extname);
 		item->tagType = ARCHIVE_TAG_TYPE_EXTENSION;
+	}
+	else if (token.desc == ARCHIVE_TAG_DEFAULT_ACL)
+	{
+		/*
+		 * Handle DEFAULT ACL entries
+		 * Format: "schema DEFAULT PRIVILEGES FOR objtype"
+		 * Example: "repack DEFAULT PRIVILEGES FOR SEQUENCES"
+		 * Extract schema name (first word before space)
+		 *
+		 * token.ptr points to space before data, so token.ptr+1 is first char
+		 */
+		char *schemaStart = token.ptr + 1;  /* skip space after tag */
+		char *schemaEnd = strchr(schemaStart, ' ');
+
+		if (schemaEnd == NULL)
+		{
+			log_error("Failed to parse DEFAULT ACL entry: %s", schemaStart);
+			item->tagType = ARCHIVE_TAG_TYPE_OTHER;
+			return false;
+		}
+
+		int schemaLen = schemaEnd - schemaStart;
+		int bytes = schemaLen + 1;
+
+		item->restoreListName = (char *) calloc(bytes, sizeof(char));
+
+		if (item->restoreListName == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		sformat(item->restoreListName, schemaLen + 1, "%.*s",
+				schemaLen, schemaStart);
+
+		log_info("DEFAULT ACL: extracted schema '%s' from '%s'",
+				 item->restoreListName,
+				 schemaStart);
+
+		item->tagType = ARCHIVE_TAG_TYPE_OTHER;
 	}
 	else
 	{

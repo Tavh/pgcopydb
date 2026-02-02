@@ -70,3 +70,27 @@ create table public.secrets (
 );
 
 insert into public.secrets (secret_hash) values (gen_salt('bf'));
+
+-- Test DEFAULT PRIVILEGES filtering
+-- These should be filtered when test_ext schema is filtered
+
+-- Create role for default privileges
+create role default_priv_role;
+
+-- Set default privileges in extension schema (should be filtered)
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_ext
+    GRANT SELECT ON TABLES TO default_priv_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_ext
+    GRANT USAGE ON SEQUENCES TO default_priv_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA test_ext
+    GRANT EXECUTE ON FUNCTIONS TO default_priv_role;
+
+-- Test FOR ROLE variant
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA test_ext
+    GRANT SELECT ON TABLES TO public;
+
+-- Test non-filtered schema (should NOT be filtered)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO default_priv_role;

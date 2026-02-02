@@ -232,6 +232,35 @@ else
     grep -i "test_ext" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list" | head -20
 fi
 
+# Check for DEFAULT ACL filtering
+echo ""
+echo "4b. Checking DEFAULT ACL filtering:"
+echo ""
+if grep -E "DEFAULT ACL.*test_ext" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list" >/dev/null 2>&1; then
+	echo "   Found DEFAULT ACL entries for test_ext:"
+	grep -E "DEFAULT ACL.*test_ext" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list"
+	echo ""
+
+	# Check if they have ; prefix (filtered)
+	if grep -E "^;.*DEFAULT ACL.*test_ext" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list" >/dev/null 2>&1; then
+		echo "   ✓ PASS: DEFAULT ACL properly filtered (have ';' prefix)"
+	else
+		echo "   ❌ FAIL: DEFAULT ACL for test_ext found but NOT filtered (missing ';' prefix)"
+		exit 1
+	fi
+else
+	echo "   ⚠️  No DEFAULT ACL entries for test_ext found (may be expected if not created)"
+fi
+
+# Verify public schema DEFAULT ACL is NOT filtered (if it exists)
+if grep -E "DEFAULT ACL.*public" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list" >/dev/null 2>&1; then
+	if grep -E "^[^;].*DEFAULT ACL.*public" "$WORKDIR/pgcopydb-work/schema/pre-filtered.list" >/dev/null 2>&1; then
+		echo "   ✓ PASS: DEFAULT ACL for public schema preserved (not filtered)"
+	else
+		echo "   ⚠️  DEFAULT ACL for public found but appears filtered"
+	fi
+fi
+
 # Check logs for ACL filtering messages
 echo ""
 echo "5. Checking pgcopydb logs for ACL filtering:"

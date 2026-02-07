@@ -2219,7 +2219,7 @@ catalog_add_s_view(DatabaseCatalog *catalog, SourceView *view)
 	}
 
 	char *sql =
-		"insert into s_view("
+		"insert or ignore into s_view("
 		"  oid, qname, nspname, relname, restore_list_name) "
 		"values($1, $2, $3, $4, $5)";
 
@@ -2537,7 +2537,7 @@ catalog_add_s_trigger(DatabaseCatalog *catalog, SourceTrigger *trigger)
 	}
 
 	char *sql =
-		"insert into s_trigger("
+		"insert or ignore into s_trigger("
 		"  oid, tgname, nspname, relname, tableoid, restore_list_name) "
 		"values($1, $2, $3, $4, $5, $6)";
 

@@ -137,6 +137,7 @@ jobs:
           - pagila-standby
           - blobs
           - filtering
+          - filtering-standby
           - extensions
           - timescaledb
           - skip-publications

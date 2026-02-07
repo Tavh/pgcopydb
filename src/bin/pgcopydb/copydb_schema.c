@@ -453,8 +453,24 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	if (specs->sourceSnapshot.isReadOnly && specs->filters.type !=
-		SOURCE_FILTER_TYPE_NONE)
+	/*
+	 * Detect if the source is a read-only standby. The snapshot path sets
+	 * sourceSnapshot.isReadOnly, but the fresh-connection path (used by
+	 * pgcopydb list commands) does not, so query pg_is_in_recovery() as a
+	 * fallback.
+	 */
+	bool sourceIsReadOnly = specs->sourceSnapshot.isReadOnly;
+
+	if (!sourceIsReadOnly)
+	{
+		if (!pgsql_is_in_recovery(src, &sourceIsReadOnly))
+		{
+			log_error("Failed to check if source is in recovery");
+			return false;
+		}
+	}
+
+	if (sourceIsReadOnly && specs->filters.type != SOURCE_FILTER_TYPE_NONE)
 	{
 		log_info("Connected to a read-only standby server with filters: "
 				 "using CTE-based filtering instead of temp tables");

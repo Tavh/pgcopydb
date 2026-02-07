@@ -918,7 +918,7 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 										0, NULL, NULL,
 										&context, &getTableSizeArray);
 
-	if (filters->ctePreamble != NULL)
+	if (filters->ctePreamble != NULL && sql != NULL)
 	{
 		free(sql);
 	}
@@ -1477,7 +1477,7 @@ schema_list_ordinary_tables(PGSQL *pgsql,
 	bool ok = pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 										&context, &getTableArray);
 
-	if (filters->ctePreamble != NULL)
+	if (filters->ctePreamble != NULL && sql != NULL)
 	{
 		free(sql);
 	}
@@ -2958,7 +2958,7 @@ schema_list_all_indexes(PGSQL *pgsql,
 	bool ok = pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 										&context, &getIndexArray);
 
-	if (filters->ctePreamble != NULL)
+	if (filters->ctePreamble != NULL && sql != NULL)
 	{
 		free(sql);
 	}
@@ -3320,7 +3320,7 @@ schema_list_pg_depend(PGSQL *pgsql,
 	bool ok = pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 										&context, &getDependArray);
 
-	if (filters->ctePreamble != NULL)
+	if (filters->ctePreamble != NULL && sql != NULL)
 	{
 		free(sql);
 	}

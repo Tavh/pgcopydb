@@ -38,7 +38,27 @@ psql -d ${PGCOPYDB_SOURCE_STANDBY_PGURI} -c "SELECT pg_is_in_recovery();"
 # ============================================================
 export TMPDIR=/tmp/exclude
 
+# list the exclude filters now, and the computed dependencies
+cat /usr/src/pgcopydb/exclude.ini
+
+# list the tables that are (not) selected by the filters
+pgcopydb list tables --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/exclude.ini
+pgcopydb list tables --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/exclude.ini --list-skipped
+
+# list the dependencies of objects that are not selected by the filters
+pgcopydb list depends --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/exclude.ini --list-skipped
+
+# list the sequences that are (not) selected by the filters
+pgcopydb list sequences --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/exclude.ini
+pgcopydb list sequences --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/exclude.ini --list-skipped
+
 pgcopydb clone --filters /usr/src/pgcopydb/exclude.ini --skip-ext-comments --notice \
+         --resume --not-consistent \
          --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
          --target ${PGCOPYDB_TARGET_PGURI}
 
@@ -71,7 +91,14 @@ createdb -U postgres -h target pagila
 
 export TMPDIR=/tmp/include
 
+# list the tables that are (not) selected by the filters
+pgcopydb list tables --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/include.ini
+pgcopydb list tables --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
+         --filters /usr/src/pgcopydb/include.ini --list-skipped
+
 pgcopydb clone --filters /usr/src/pgcopydb/include.ini --skip-ext-comments --notice \
+         --resume --not-consistent \
          --source ${PGCOPYDB_SOURCE_STANDBY_PGURI} \
          --target ${PGCOPYDB_TARGET_PGURI}
 

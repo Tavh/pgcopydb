@@ -597,27 +597,34 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 		}
 	}
 
-	/* fetch the list of views for visibility and tracking */
-	if (specs->section == DATA_SECTION_ALL ||
-		specs->section == DATA_SECTION_SCHEMA)
+	/* fetch the list of views and triggers for visibility and tracking */
+	if ((specs->section == DATA_SECTION_ALL ||
+		 specs->section == DATA_SECTION_SCHEMA) &&
+		!sourceDB->sections[DATA_SECTION_SCHEMA].fetched)
 	{
-		log_debug("Fetching list of views from source database");
+		TopLevelTiming timing = {
+			.label = CopyDataSectionToString(DATA_SECTION_SCHEMA)
+		};
+
+		(void) catalog_start_timing(&timing);
 
 		if (!schema_list_views(src, &(specs->filters), sourceDB))
 		{
 			log_info("Failed to list views, continuing without view tracking");
 		}
-	}
-
-	/* fetch the list of triggers for visibility and tracking */
-	if (specs->section == DATA_SECTION_ALL ||
-		specs->section == DATA_SECTION_SCHEMA)
-	{
-		log_debug("Fetching list of triggers from source database");
 
 		if (!schema_list_triggers(src, &(specs->filters), sourceDB))
 		{
 			log_info("Failed to list triggers, continuing without trigger tracking");
+		}
+
+		(void) catalog_stop_timing(&timing);
+
+		if (!catalog_register_section(sourceDB, &timing))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(sourceDB->sema));
+			return false;
 		}
 	}
 

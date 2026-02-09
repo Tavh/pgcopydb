@@ -333,6 +333,19 @@ typedef struct GeneratedColumnsCache
 
 
 /*
+ * Simple hash table to track materialized views by (nspname, relname).
+ * Used during CDC transform to skip DML targeting matviews.
+ */
+typedef struct MatViewCache
+{
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+
+	UT_hash_handle hh;
+} MatViewCache;
+
+
+/*
  * StreamContext allows tracking the progress of the ld_stream module and is
  * shared also with the ld_transform module, which has its own instance of a
  * StreamContext to track its own progress.
@@ -368,6 +381,9 @@ typedef struct StreamContext
 
 	/* hash table acts as a cache for tables with generated columns */
 	GeneratedColumnsCache *generatedColumnsCache;
+
+	/* hash table cache for materialized views (skip DML during CDC) */
+	MatViewCache *matViewCache;
 
 	/* table filtering configuration */
 	SourceFilters *filters;

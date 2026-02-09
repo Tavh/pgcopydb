@@ -69,6 +69,14 @@ static GeneratedColumnSet * lookupGeneratedColumnsForTable(GeneratedColumnsCache
 														   const char *nspname,
 														   const char *relname);
 
+static bool lookupMatViewCache(MatViewCache *cache,
+							   const char *nspname,
+							   const char *relname);
+
+static bool prepareMatViewCache_hook(void *ctx, CatalogMatView *matview);
+
+static bool prepareMatViewCache(StreamSpecs *specs);
+
 /*
  * stream_transform_context_init initializes StreamContext for the transform
  * operation.
@@ -100,6 +108,16 @@ stream_transform_context_init(StreamSpecs *specs)
 	 * columns in the SQL output.
 	 */
 	if (!prepareGeneratedColumnsCache(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Prepare the materialized view cache, which helps to skip DML
+	 * targeting matviews in the SQL output.
+	 */
+	if (!prepareMatViewCache(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1412,6 +1430,57 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 							  jsmesgtype);
 					return false;
 				}
+			}
+
+			/* skip DML targeting materialized views */
+			const char *stmtNspname = NULL;
+			const char *stmtRelname = NULL;
+
+			switch (metadata->action)
+			{
+				case STREAM_ACTION_INSERT:
+				{
+					stmtNspname = stmt->stmt.insert.table.nspname;
+					stmtRelname = stmt->stmt.insert.table.relname;
+					break;
+				}
+
+				case STREAM_ACTION_UPDATE:
+				{
+					stmtNspname = stmt->stmt.update.table.nspname;
+					stmtRelname = stmt->stmt.update.table.relname;
+					break;
+				}
+
+				case STREAM_ACTION_DELETE:
+				{
+					stmtNspname = stmt->stmt.delete.table.nspname;
+					stmtRelname = stmt->stmt.delete.table.relname;
+					break;
+				}
+
+				case STREAM_ACTION_TRUNCATE:
+				{
+					stmtNspname = stmt->stmt.truncate.table.nspname;
+					stmtRelname = stmt->stmt.truncate.table.relname;
+					break;
+				}
+
+				default:
+				{
+					break;
+				}
+			}
+
+			if (stmtNspname != NULL &&
+				lookupMatViewCache(privateContext->matViewCache,
+								   stmtNspname, stmtRelname))
+			{
+				log_notice("Skipping %c on materialized view %s.%s",
+						   metadata->action, stmtNspname, stmtRelname);
+				free(stmt);
+				privateContext->stmt = NULL;
+				break;
 			}
 
 			(void) streamLogicalTransactionAppendStatement(txn, stmt);
@@ -2766,6 +2835,35 @@ lookupGeneratedColumnsForTable(GeneratedColumnsCache *cache,
 
 
 /*
+ * lookupMatViewCache checks if the given nspname.relname is a materialized
+ * view. Returns true when the relation is a matview, false otherwise.
+ */
+static bool
+lookupMatViewCache(MatViewCache *cache, const char *nspname, const char *relname)
+{
+	if (cache == NULL)
+	{
+		return false;
+	}
+
+	MatViewCache key = { 0 };
+
+	NORMALIZED_PG_NAMEDATA_COPY(key.nspname, nspname);
+	NORMALIZED_PG_NAMEDATA_COPY(key.relname, relname);
+
+	MatViewCache *item = NULL;
+
+	unsigned keylen = offsetof(MatViewCache, relname) +
+					  sizeof(key.relname) -
+					  offsetof(MatViewCache, nspname);
+
+	HASH_FIND(hh, cache, &key.nspname, keylen, item);
+
+	return item != NULL;
+}
+
+
+/*
  * isGeneratedColumn checks whether the given "attname" is a generated column.
  *
  * Returns true if the column is generated, false otherwise.
@@ -2880,6 +2978,60 @@ prepareGeneratedColumnsCache(StreamSpecs *specs)
 												&prepareGeneratedColumnsCache_hook))
 	{
 		log_error("Failed to prepare a generated column cache for our catalog,"
+				  "see above for details");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * prepareMatViewCache_hook is a callback function that populates the
+ * materialized view cache from the catalog.
+ */
+static bool
+prepareMatViewCache_hook(void *ctx, CatalogMatView *matview)
+{
+	StreamSpecs *specs = (StreamSpecs *) ctx;
+	StreamContext *privateContext = &(specs->private);
+
+	MatViewCache *item = (MatViewCache *) calloc(1, sizeof(MatViewCache));
+
+	if (item == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	NORMALIZED_PG_NAMEDATA_COPY(item->nspname, matview->nspname);
+	NORMALIZED_PG_NAMEDATA_COPY(item->relname, matview->relname);
+
+	unsigned keylen = offsetof(MatViewCache, relname) +
+					  sizeof(item->relname) -
+					  offsetof(MatViewCache, nspname);
+
+	HASH_ADD(hh, privateContext->matViewCache, nspname, keylen, item);
+
+	log_debug("MatViewCache: added \"%s\".\"%s\"",
+			  matview->nspname, matview->relname);
+
+	return true;
+}
+
+
+/*
+ * prepareMatViewCache fills-in the cache with the materialized views from our
+ * catalog, so that we can skip DML targeting matviews during CDC transform.
+ */
+static bool
+prepareMatViewCache(StreamSpecs *specs)
+{
+	if (!catalog_iter_s_matview(specs->sourceDB,
+								specs,
+								&prepareMatViewCache_hook))
+	{
+		log_error("Failed to prepare materialized view cache, "
 				  "see above for details");
 		return false;
 	}

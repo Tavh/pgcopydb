@@ -2205,6 +2205,153 @@ catalog_s_matview_fetch(SQLiteQuery *query)
 
 
 /*
+ * catalog_iter_s_matview iterates over all materialized views in our catalog.
+ */
+bool
+catalog_iter_s_matview(DatabaseCatalog *catalog,
+					   void *context,
+					   CatalogMatViewIterFun *callback)
+{
+	CatalogMatViewIterator *iter =
+		(CatalogMatViewIterator *) calloc(1, sizeof(CatalogMatViewIterator));
+
+	iter->catalog = catalog;
+
+	if (!catalog_iter_s_matview_init(iter))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (;;)
+	{
+		if (!catalog_iter_s_matview_next(iter))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		CatalogMatView *matview = iter->matview;
+
+		if (matview == NULL)
+		{
+			if (!catalog_iter_s_matview_finish(iter))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			break;
+		}
+
+		/* now call the provided callback */
+		if (!(*callback)(context, matview))
+		{
+			log_error("Failed to iterate over list of materialized views, "
+					  "see above for details");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_matview_init initializes an iterator over our catalog of
+ * materialized view entries.
+ */
+bool
+catalog_iter_s_matview_init(CatalogMatViewIterator *iter)
+{
+	sqlite3 *db = iter->catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_iter_s_matview_init: db is NULL");
+		return false;
+	}
+
+	iter->matview = (CatalogMatView *) calloc(1, sizeof(CatalogMatView));
+
+	if (iter->matview == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	char *sql =
+		"  select oid, nspname, relname, restore_list_name, exclude_data"
+		"    from s_matview";
+
+	SQLiteQuery *query = &(iter->query);
+
+	query->context = iter->matview;
+	query->fetchFunction = &catalog_s_matview_fetch;
+
+	if (!catalog_sql_prepare(db, sql, query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_matview_next fetches the next CatalogMatView entry.
+ */
+bool
+catalog_iter_s_matview_next(CatalogMatViewIterator *iter)
+{
+	SQLiteQuery *query = &(iter->query);
+
+	int rc = catalog_sql_step(query);
+
+	if (rc == SQLITE_DONE)
+	{
+		iter->matview = NULL;
+
+		return true;
+	}
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("Failed to step through statement: %s", query->sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(query->db));
+		return false;
+	}
+
+	return catalog_s_matview_fetch(query);
+}
+
+
+/*
+ * catalog_iter_s_matview_finish cleans up the iterator resources.
+ */
+bool
+catalog_iter_s_matview_finish(CatalogMatViewIterator *iter)
+{
+	SQLiteQuery *query = &(iter->query);
+
+	/* in case we finish before reaching the DONE step */
+	if (iter->matview != NULL)
+	{
+		iter->matview = NULL;
+	}
+
+	if (!catalog_sql_finalize(query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * catalog_add_s_view INSERTs a SourceView to our internal catalogs database.
  */
 bool

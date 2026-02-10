@@ -482,6 +482,8 @@ typedef struct StreamApplyContext
 	PreparedStmt *preparedStmt;
 
 	SourceFilters *filters;     /* table filtering configuration */
+
+	uint64_t pipelineBytes;     /* accumulated bytes in pipeline buffer */
 } StreamApplyContext;
 
 

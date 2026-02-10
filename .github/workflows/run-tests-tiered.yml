@@ -149,6 +149,7 @@ jobs:
           - cdc-filtering
           - cdc-wal2json
           - follow-wal2json
+          - follow-standby
           - follow-9.6
           - follow-data-only
           - endpos-in-multi-wal-txn

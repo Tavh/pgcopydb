@@ -747,6 +747,25 @@ stream_apply_sql(StreamApplyContext *context,
 				return false;
 			}
 
+			/* Clean up prepared statements (see COMMIT for explanation) */
+			if (context->preparedStmt != NULL)
+			{
+				if (!pgsql_execute(applyPgConn, "DEALLOCATE ALL"))
+				{
+					log_warn("Failed to deallocate prepared statements");
+				}
+
+				PreparedStmt *current, *tmp;
+
+				HASH_ITER(hh, context->preparedStmt, current, tmp)
+				{
+					HASH_DEL(context->preparedStmt, current);
+					free(current);
+				}
+
+				context->preparedStmt = NULL;
+			}
+
 			/* Reset the transactionInProgress after abort */
 			context->transactionInProgress = false;
 
@@ -837,6 +856,34 @@ stream_apply_sql(StreamApplyContext *context,
 			{
 				/* errors have already been logged */
 				return false;
+			}
+
+			/*
+			 * Deallocate all prepared statements on the server and clear
+			 * the client-side hash table. Prepared statement names are
+			 * 32-bit hashes of the SQL text, so hash collisions are
+			 * possible when many unique statements accumulate across
+			 * transactions (birthday paradox). Clearing at COMMIT
+			 * prevents a new PREPARE from being silently skipped when
+			 * its hash collides with a previously prepared statement
+			 * that has a different parameter count.
+			 */
+			if (context->preparedStmt != NULL)
+			{
+				if (!pgsql_execute(applyPgConn, "DEALLOCATE ALL"))
+				{
+					log_warn("Failed to deallocate prepared statements");
+				}
+
+				PreparedStmt *current, *tmp;
+
+				HASH_ITER(hh, context->preparedStmt, current, tmp)
+				{
+					HASH_DEL(context->preparedStmt, current);
+					free(current);
+				}
+
+				context->preparedStmt = NULL;
 			}
 
 			context->transactionInProgress = false;

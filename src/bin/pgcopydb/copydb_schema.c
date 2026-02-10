@@ -468,6 +468,14 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 			log_error("Failed to check if source is in recovery");
 			return false;
 		}
+
+		/*
+		 * Propagate the recovery flag to the snapshot so that COPY workers
+		 * use READ ONLY transaction mode. In clone --follow the snapshot
+		 * comes from the logical replication slot and copydb_export_snapshot
+		 * is never called, leaving sourceSnapshot.isReadOnly unset.
+		 */
+		specs->sourceSnapshot.isReadOnly = sourceIsReadOnly;
 	}
 
 	if (sourceIsReadOnly && specs->filters.type != SOURCE_FILTER_TYPE_NONE)

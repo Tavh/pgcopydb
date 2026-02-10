@@ -12,7 +12,7 @@ BUILD_ARGS = --build-arg PGVERSION=$(PGVERSION)
 
 all: pagila pagila-multi-steps blobs unit filtering filtering-standby extensions \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-between-transaction cdc-low-level \
-	 follow-wal2json follow-9.6 follow-data-only \
+	 follow-wal2json follow-standby follow-9.6 follow-data-only \
 	 endpos-in-multi-wal-txn exclude-extension;
 
 pagila: build
@@ -54,6 +54,9 @@ cdc-low-level: build
 follow-wal2json: build
 	$(MAKE) -C $@
 
+follow-standby: build
+	$(MAKE) -C $@
+
 follow-9.6: build
 	$(MAKE) -C $@
 
@@ -76,5 +79,5 @@ build:
 .PHONY: all build
 .PHONY: pagila pagila-multi-steps blobs unit filtering filtering-standby extensions
 .PHONY: cdc-wal2json cdc-test-decoding cdc-low-level
-.PHONY: follow-wal2json follow-9.6
+.PHONY: follow-wal2json follow-standby follow-9.6
 .PHONY: endpos-in-multi-wal-txn exclude-extension

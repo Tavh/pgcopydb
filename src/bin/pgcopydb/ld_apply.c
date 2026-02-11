@@ -1273,6 +1273,27 @@ stream_apply_sql(StreamApplyContext *context,
 						context->pipelineBytes += strlen(paramValues[j]);
 					}
 				}
+
+				/*
+				 * When a single transaction contains many large rows
+				 * (e.g. 330 MB email bodies), the pipeline buffer can
+				 * exceed libpq's ~1 GB limit before reaching COMMIT.
+				 * Sync mid-transaction to drain the buffer.  This is
+				 * safe: we use explicit BEGIN/COMMIT, so a pipeline
+				 * sync only flushes pending results without affecting
+				 * the transaction.
+				 */
+				if (context->pipelineBytes >= PIPELINE_BYTES_SYNC_THRESHOLD)
+				{
+					if (!pgsql_sync_pipeline(applyPgConn))
+					{
+						log_error("Failed to sync the pipeline, "
+								  "see previous error for details");
+						return false;
+					}
+
+					context->pipelineBytes = 0;
+				}
 			}
 
 

@@ -3511,6 +3511,77 @@ schema_list_pg_depend(PGSQL *pgsql,
 		}
 	}
 
+	/* Query 5: Functions depending on excluded schemas */
+	if (filters->excludeSchemaList.count > 0)
+	{
+		char *func_depend_sql =
+			"SELECT fn.nspname, '' AS relname, "
+			"       d.refclassid, d.refobjid, "
+			"       'pg_proc'::regclass::oid AS classid, "
+			"       p.oid AS objid, "
+			"       d.deptype, "
+			"       'function' AS type, "
+			"       fn.nspname || '.' || p.proname AS identity "
+			"  FROM pg_catalog.pg_proc p "
+			"  JOIN pg_catalog.pg_namespace fn "
+			"    ON p.pronamespace = fn.oid "
+			"  JOIN pg_catalog.pg_depend d "
+			"    ON d.classid = 'pg_proc'::regclass "
+			"   AND d.objid = p.oid "
+			" WHERE fn.nspname !~ '^pg_' "
+			"   AND fn.nspname <> 'information_schema' "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM filter_exclude_schema xs "
+			"        WHERE xs.nspname = fn.nspname) "
+			"   AND NOT EXISTS ("
+			"       SELECT 1 FROM pg_depend ed "
+			"        WHERE ed.objid = p.oid "
+			"          AND ed.deptype = 'e') "
+			"   AND ("
+			"     (d.refclassid = 'pg_proc'::regclass AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_proc rp "
+			"       JOIN pg_catalog.pg_namespace rn "
+			"         ON rp.pronamespace = rn.oid "
+			"       JOIN filter_exclude_schema es "
+			"         ON rn.nspname = es.nspname "
+			"       WHERE rp.oid = d.refobjid)) "
+			"     OR "
+			"     (d.refclassid = 'pg_class'::regclass AND EXISTS ("
+			"       SELECT 1 FROM pg_catalog.pg_class rc "
+			"       JOIN pg_catalog.pg_namespace rn "
+			"         ON rc.relnamespace = rn.oid "
+			"       JOIN filter_exclude_schema es "
+			"         ON rn.nspname = es.nspname "
+			"       WHERE rc.oid = d.refobjid)) "
+			"     OR "
+			"     (d.refclassid = 'pg_namespace'::regclass AND EXISTS ("
+			"       SELECT 1 FROM filter_exclude_schema es "
+			"       JOIN pg_catalog.pg_namespace rn "
+			"         ON rn.nspname = es.nspname "
+			"       WHERE rn.oid = d.refobjid)) "
+			"   ) "
+			" GROUP BY fn.nspname, p.oid, p.proname, "
+			"          d.refclassid, d.refobjid, d.deptype";
+
+		SourceDependArrayContext funcContext = { { 0 }, catalog, false };
+
+		log_info("Fetching functions depending on excluded schemas");
+
+		if (!pgsql_execute_with_params(pgsql, func_depend_sql,
+									   0, NULL, NULL,
+									   &funcContext, &getDependArray))
+		{
+			log_error("Failed to list function cross-schema dependencies");
+			return false;
+		}
+
+		if (!funcContext.parsedOk)
+		{
+			log_error("Failed to parse function cross-schema dependencies");
+			return false;
+		}
+	}
+
 	/* Query 4: Event trigger backing functions */
 	if (filters->excludeEventTriggerList.count > 0)
 	{

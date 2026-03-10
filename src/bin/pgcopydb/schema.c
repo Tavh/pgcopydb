@@ -3342,7 +3342,16 @@ schema_list_pg_depend(PGSQL *pgsql,
 	 * Cross-schema dependency filtering: detect objects in non-excluded
 	 * schemas that reference objects in excluded schemas. These must also
 	 * be filtered out to avoid pg_restore failures.
+	 *
+	 * These queries reference the filter_exclude_schema temp table created
+	 * by prepareFilters(). On read-only standbys, temp tables cannot be
+	 * created, so we skip these queries for now.
 	 */
+	if (filters->isReadOnly)
+	{
+		log_info("Skipping cross-schema dependency queries on read-only source");
+		return true;
+	}
 
 	/* Query 1: FK constraints referencing tables in excluded schemas */
 	if (filters->excludeSchemaList.count > 0)

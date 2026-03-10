@@ -3300,7 +3300,6 @@ schema_list_pg_depend(PGSQL *pgsql,
 		}
 
 		log_info("Extension dependencies fetched successfully");
-		return true;
 	}
 
 	log_debug("listSourceDependSQL[%s]", filterTypeToString(filters->type));

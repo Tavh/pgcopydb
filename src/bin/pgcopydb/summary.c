@@ -104,6 +104,12 @@ TopLevelTiming topLevelTimingArray[] = {
 		.jobsMask = TIMING_RESTORE_JOBS
 	},
 	{
+		.section = TIMING_SECTION_SNAPSHOT_DONE,
+		.label = "Snapshot Done",
+		.conn = "source",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
 		.section = TIMING_SECTION_TOTAL,
 		.label = "Total Wall Clock Duration",
 		.conn = "both",

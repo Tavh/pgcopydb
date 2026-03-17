@@ -253,6 +253,79 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	}
 
 	/*
+	 * When the source is a read-only standby, validate that prerequisites
+	 * are met: PostgreSQL >= 16 (required for logical replication from
+	 * standby) and hot_standby_feedback = on (prevents replication slot
+	 * invalidation on the standby).
+	 */
+	if (copySpecs->sourceSnapshot.isReadOnly)
+	{
+		PGSQL srcValidation = { 0 };
+
+		if (!pgsql_init(&srcValidation,
+						copySpecs->connStrings.source_pguri,
+						PGSQL_CONN_SOURCE))
+		{
+			log_error("Failed to init connection for standby validation");
+			exit(EXIT_CODE_SOURCE);
+		}
+
+		if (!pgsql_server_version(&srcValidation))
+		{
+			log_error("Failed to query server version for standby validation");
+			pgsql_finish(&srcValidation);
+			exit(EXIT_CODE_SOURCE);
+		}
+
+		if (srcValidation.pgversion_num < 160000)
+		{
+			log_fatal("Logical replication from a standby requires "
+					  "PostgreSQL 16 or later, source server is %s",
+					  srcValidation.pgversion);
+			pgsql_finish(&srcValidation);
+			exit(EXIT_CODE_SOURCE);
+		}
+
+		/*
+		 * Query hot_standby_feedback; when it is off the primary may remove
+		 * rows that the standby's logical replication slot still needs,
+		 * leading to replication slot invalidation.
+		 */
+		{
+			SingleValueResultContext ctx =
+				{ { 0 }, PGSQL_RESULT_BOOL, false };
+
+			const char *sql =
+				"SELECT current_setting('hot_standby_feedback')::bool";
+
+			if (!pgsql_execute_with_params(&srcValidation, sql,
+										   0, NULL, NULL,
+										   &ctx,
+										   &parseSingleValueResult))
+			{
+				log_error("Failed to query hot_standby_feedback");
+				pgsql_finish(&srcValidation);
+				exit(EXIT_CODE_SOURCE);
+			}
+
+			if (!ctx.parsedOk || !ctx.boolVal)
+			{
+				log_fatal("Logical replication from a standby requires "
+						  "hot_standby_feedback = on to prevent "
+						  "replication slot invalidation");
+				pgsql_finish(&srcValidation);
+				exit(EXIT_CODE_SOURCE);
+			}
+		}
+
+		log_info("Standby validation passed: PostgreSQL %s with "
+				 "hot_standby_feedback = on",
+				 srcValidation.pgversion);
+
+		pgsql_finish(&srcValidation);
+	}
+
+	/*
 	 * When --follow has been used, we start two subprocess (clone, follow).
 	 * Before doing that though, we want to make sure it was possible to setup
 	 * the source and target database for Change Data Capture.

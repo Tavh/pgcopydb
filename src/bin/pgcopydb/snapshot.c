@@ -573,6 +573,35 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 	sourceSnapshot->state = SNAPSHOT_STATE_EXPORTED;
 	sourceSnapshot->exportedCreateSlotSnapshot = true;
 
+	/*
+	 * Detect if the source database is a read-only standby. This must be
+	 * done here in the main process before forking workers, so that forked
+	 * child processes inherit the isReadOnly flag via the copied
+	 * sourceSnapshot structure.
+	 *
+	 * The replication protocol connection used above does not support
+	 * pg_is_in_recovery(), so we open a temporary standard connection.
+	 */
+	{
+		PGSQL tmpSrc = { 0 };
+
+		if (!pgsql_init(&tmpSrc, sourceSnapshot->pguri,
+						sourceSnapshot->connectionType))
+		{
+			log_error("Failed to init connection for recovery check");
+			return false;
+		}
+
+		if (!pgsql_is_in_recovery(&tmpSrc, &(sourceSnapshot->isReadOnly)))
+		{
+			log_error("Failed to check if source is in recovery");
+			pgsql_finish(&tmpSrc);
+			return false;
+		}
+
+		pgsql_finish(&tmpSrc);
+	}
+
 	/* store the snapshot in a file, to support --resume --snapshot ... */
 	if (!write_file(sourceSnapshot->snapshot,
 					strlen(sourceSnapshot->snapshot),

@@ -182,6 +182,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "restore-tolerance", required_argument, NULL, 256 },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -407,6 +408,19 @@ cli_restore_schema_getopts(int argc, char **argv)
 			{
 				commandline_help(stderr);
 				exit(EXIT_CODE_QUIT);
+				break;
+			}
+
+			case 256:
+			{
+				if (!stringToInt(optarg, &options.restoreOptions.restoreTolerance) ||
+					options.restoreOptions.restoreTolerance < 0)
+				{
+					log_fatal("Failed to parse --restore-tolerance: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--restore-tolerance %d",
+						  options.restoreOptions.restoreTolerance);
 				break;
 			}
 

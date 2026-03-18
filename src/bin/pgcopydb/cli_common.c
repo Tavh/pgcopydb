@@ -218,6 +218,7 @@ cli_copydb_getenv(CopyDBOptions *options)
 	options->restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
+	options->restoreOptions.restoreTolerance = DEFAULT_RESTORE_TOLERANCE;
 
 	EnvParser parsers[] = {
 		{ PGCOPYDB_TABLE_JOBS, ENV_TYPE_INT,
@@ -253,7 +254,9 @@ cli_copydb_getenv(CopyDBOptions *options)
 		{ PGCOPYDB_USE_COPY_BINARY, ENV_TYPE_BOOL,
 		  &(options->useCopyBinary) },
 		{ PGCOPYDB_SKIP_XID_CHECK, ENV_TYPE_BOOL,
-		  &(options->skipXidCheck) }
+		  &(options->skipXidCheck) },
+		{ PGCOPYDB_RESTORE_TOLERANCE, ENV_TYPE_INT,
+		  &(options->restoreOptions.restoreTolerance), 0, true, 0, true, 10000 }
 	};
 
 	int parserCount = sizeof(parsers) / sizeof(parsers[0]);
@@ -644,6 +647,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "restore-tolerance", required_argument, NULL, 256 },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -1109,6 +1113,19 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.useCopyBinary = true;
 				log_trace("--use-copy-binary");
+				break;
+			}
+
+			case 256:
+			{
+				if (!stringToInt(optarg, &options.restoreOptions.restoreTolerance) ||
+					options.restoreOptions.restoreTolerance < 0)
+				{
+					log_fatal("Failed to parse --restore-tolerance: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--restore-tolerance %d",
+						  options.restoreOptions.restoreTolerance);
 				break;
 			}
 

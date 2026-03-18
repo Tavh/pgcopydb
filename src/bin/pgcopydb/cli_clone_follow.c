@@ -293,7 +293,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		 */
 		{
 			SingleValueResultContext ctx =
-				{ { 0 }, PGSQL_RESULT_BOOL, false };
+			{ { 0 }, PGSQL_RESULT_BOOL, false };
 
 			const char *sql =
 				"SELECT current_setting('hot_standby_feedback')::bool";

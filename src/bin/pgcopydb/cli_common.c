@@ -1114,7 +1114,8 @@ cli_copy_db_getopts(int argc, char **argv)
 					log_fatal("Failed to parse --restore-tolerance: \"%s\"", optarg);
 					++errors;
 				}
-				log_trace("--restore-tolerance %d", options.restoreOptions.restoreTolerance);
+				log_trace("--restore-tolerance %d",
+						  options.restoreOptions.restoreTolerance);
 				break;
 			}
 

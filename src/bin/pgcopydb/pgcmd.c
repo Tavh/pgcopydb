@@ -40,7 +40,6 @@
 #include "runprogram.h"
 
 
-
 /*
  * Get psql --version output in pgPaths->pg_version.
  */

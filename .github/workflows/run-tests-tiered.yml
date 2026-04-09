@@ -155,6 +155,7 @@ jobs:
           - endpos-in-multi-wal-txn
           - blob-snapshot-release
           - follow-defer-indexes
+          - fk-not-valid
         exclude:
           - PGVERSION: 16
             TEST: follow-target-reconnect

@@ -29,11 +29,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.inject
+    user: "0"
     env_file:
       - ../uris.env
       - ../paths.env
     # share TMPDIR between inject and test services
+    # Docker socket mounted so inject can stop/start the target container
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - follow-target-reconnect:/var/run/pgcopydb
 
   test:

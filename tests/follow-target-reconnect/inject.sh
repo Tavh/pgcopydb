@@ -55,21 +55,36 @@ do
 done
 
 #
-# Simulate a target database connection drop. This terminates all active
-# connections to the target database (except our own psql session), causing
-# pgcopydb's replay process to receive an SSL EOF. The retry logic in
-# follow_main_loop should detect the failure, back off, and reconnect.
+# Simulate a target database outage by stopping the target container entirely.
+# This causes pgcopydb's apply process to receive connection-refused errors on
+# the next SQL execution, which propagates up to followDB() returning false,
+# triggering the retry logic in follow_main_loop.
 #
-psql -d ${PGCOPYDB_TARGET_PGURI} \
-    -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid != pg_backend_pid()"
+TARGET=$(docker ps -q --filter "label=com.docker.compose.service=target" | head -1)
 
-# Allow time for pgcopydb to detect the failure and complete its first retry
-# backoff (FOLLOW_RETRY_BASE_SLEEP_SECS = 5s) plus reconnect overhead.
+if [ -z "${TARGET}" ]
+then
+    echo "ERROR: could not find target container via docker socket"
+    exit 1
+fi
+
+docker stop "${TARGET}"
+
+# Wait long enough for pgcopydb to detect the failure and begin its first
+# retry backoff (FOLLOW_RETRY_BASE_SLEEP_SECS = 5s).
 sleep 15
+
+docker start "${TARGET}"
+
+# Wait for target to accept connections again before injecting more DML.
+until psql -d ${PGCOPYDB_TARGET_PGURI} -c "SELECT 1" >/dev/null 2>&1
+do
+    sleep 1
+done
 
 #
 # Inject 2 more rounds of DML after the reconnect to verify that changes
-# applied after the blip are also captured and replayed correctly.
+# applied after the outage are also captured and replayed correctly.
 #
 for i in `seq 2`
 do

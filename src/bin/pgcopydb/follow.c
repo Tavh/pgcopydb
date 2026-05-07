@@ -17,6 +17,10 @@
 #include "progress.h"
 #include "signals.h"
 
+#define FOLLOW_RETRY_MAX 10
+#define FOLLOW_RETRY_BASE_SLEEP_SECS 5
+#define FOLLOW_RETRY_MAX_SLEEP_SECS 300
+
 
 /*
  * follow_export_snapshot opens a snapshot that we're going to re-use in all
@@ -274,7 +278,8 @@ follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	/*
 	 * In case of successful exit from the follow sub-processes, we
 	 * switch back and forth between CATCHUP and REPLAY modes and
-	 * continue replaying changes. In case of error, we stop.
+	 * continue replaying changes. On transient errors (e.g. a network
+	 * blip to the target), we back off and retry rather than dying.
 	 */
 	LogicalStreamMode modeArray[] = {
 		STREAM_MODE_CATCHUP,
@@ -286,15 +291,63 @@ follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	uint64_t loop = 0;
 	LogicalStreamMode currentMode = modeArray[0];
 	LogicalStreamMode previousMode = STREAM_MODE_UNKNOW;
+	int retries = 0;
 
 	while (true)
 	{
 		if (!followDB(copySpecs, streamSpecs))
 		{
-			log_error("Failed to follow changes from source, "
-					  "see above for details");
-			return false;
+			if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+			{
+				log_error("Failed to follow changes from source, "
+						  "see above for details");
+				return false;
+			}
+
+			if (retries >= FOLLOW_RETRY_MAX)
+			{
+				log_error("Failed to follow changes from source after %d retries, "
+						  "see above for details", retries);
+				return false;
+			}
+
+			int sleepSecs = FOLLOW_RETRY_BASE_SLEEP_SECS * (1 << retries);
+
+			if (sleepSecs > FOLLOW_RETRY_MAX_SLEEP_SECS)
+			{
+				sleepSecs = FOLLOW_RETRY_MAX_SLEEP_SECS;
+			}
+
+			log_warn("Follow pipeline failed, retrying in %ds "
+					 "(attempt %d of %d)",
+					 sleepSecs, retries + 1, FOLLOW_RETRY_MAX);
+
+			for (int s = 0; s < sleepSecs; s++)
+			{
+				if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+				{
+					return false;
+				}
+				pg_usleep(1000 * 1000);
+			}
+
+			++retries;
+
+			/* reset to catchup mode so on-disk files are applied before going live */
+			currentMode = STREAM_MODE_CATCHUP;
+			loop = 0;
+
+			if (!stream_init_for_mode(streamSpecs, currentMode))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			continue;
 		}
+
+		/* successful followDB round: reset retry counter */
+		retries = 0;
 
 		if (asked_to_quit)
 		{

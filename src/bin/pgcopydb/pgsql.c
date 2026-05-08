@@ -1971,13 +1971,24 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 			if (res == NULL)
 			{
 				/*
-				 * NULL represents a end of result for a single query, but we are
-				 * in pipeline mode and we can have multiple results.
+				 * NULL represents end of results for a single query, but in
+				 * pipeline mode there may be more results pending for later
+				 * queries. Normally PQisBusy becomes 1 while the server is
+				 * still processing, so we continue consuming.
 				 *
-				 * We need to continue consuming until we get a SYNC message.
+				 * However, if the connection died, PQisBusy stays 0 and
+				 * PQgetResult keeps returning NULL — an infinite spin loop.
+				 * Break out and surface the error instead.
 				 */
+				if (PQstatus(conn) == CONNECTION_BAD)
+				{
+					(void) pgcopy_log_error(pgsql, NULL,
+											"connection was lost during pipeline sync");
+					pgsql_finish(pgsql);
+					return false;
+				}
 
-				continue;
+				break;
 			}
 
 			results++;
@@ -2459,6 +2470,23 @@ pgsql_state_is_connection_error(PGSQL *pgsql)
 	return pgsql->connection != NULL &&
 		   (PQstatus(pgsql->connection) == CONNECTION_BAD ||
 			SQLSTATE_IS_CONNECTION_EXCEPTION(pgsql));
+}
+
+
+/*
+ * pgsql_is_permissions_error returns true when the last error on this
+ * connection was an authorization or privilege failure. These errors should
+ * not be retried — they require manual intervention (e.g. migration user
+ * was revoked).
+ *
+ * SQLSTATE class 28 = invalid_authorization_specification
+ * SQLSTATE 42501   = insufficient_privilege
+ */
+bool
+pgsql_is_permissions_error(PGSQL *pgsql)
+{
+	return (pgsql->sqlstate[0] == '2' && pgsql->sqlstate[1] == '8') ||
+		   strncmp(pgsql->sqlstate, "42501", 5) == 0;
 }
 
 

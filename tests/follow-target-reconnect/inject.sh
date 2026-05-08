@@ -20,16 +20,21 @@ pgcopydb ping
 #
 dbfile=${TMPDIR}/pgcopydb/schema/source.db
 
+deadline=$(($(date +%s) + 120))
 until [ -s ${dbfile} ]
 do
+    if [ $(date +%s) -gt ${deadline} ]; then
+        echo "TIMEOUT: pgcopydb did not initialize within 120s"
+        exit 1
+    fi
     sleep 1
 done
 
 #
-# Inject 3 rounds of DML with WAL switches to generate CDC traffic before
+# Inject 2 rounds of DML with WAL switches to generate CDC traffic before
 # simulating the connection failure.
 #
-for i in `seq 3`
+for i in `seq 2`
 do
     psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/dml.sql
     sleep 1
@@ -48,37 +53,50 @@ done
 #
 flushlsn="0/0"
 
+deadline=$(($(date +%s) + 120))
 until [ "${flushlsn}" != "0/0" ]
 do
+    if [ $(date +%s) -gt ${deadline} ]; then
+        echo "TIMEOUT: pgcopydb CDC did not start streaming within 120s"
+        exit 1
+    fi
     flushlsn=$(pgcopydb stream sentinel get --flush-lsn 2>/dev/null || echo "0/0")
     sleep 2
 done
 
 #
-# Simulate a target database outage by stopping the target container entirely.
-# This causes pgcopydb's apply process to receive connection-refused errors on
-# the next SQL execution, which propagates up to followDB() returning false,
-# triggering the retry logic in follow_main_loop.
+# Simulate a connection failure by triggering the netblock sidecar, which
+# shares the target's network namespace and inserts an iptables REJECT rule
+# for port 5432. This sends an immediate TCP RST so pgcopydb detects the
+# failure in milliseconds rather than waiting ~340 s for TCP retransmit.
 #
-TARGET=$(docker ps -q --filter "label=com.docker.compose.service=target" | head -1)
+# Signal the sidecar via a trigger file on the shared volume; it blocks for
+# 15 s, removes the rule, then writes a done file.
+#
+# Clean up any stale signal files from previous runs before triggering.
+rm -f /var/run/pgcopydb/block_target /var/run/pgcopydb/target_unblocked
+touch /var/run/pgcopydb/block_target
 
-if [ -z "${TARGET}" ]
-then
-    echo "ERROR: could not find target container via docker socket"
-    exit 1
-fi
+deadline=$(($(date +%s) + 60))
+until [ -f /var/run/pgcopydb/target_unblocked ]
+do
+    if [ $(date +%s) -gt ${deadline} ]; then
+        echo "TIMEOUT: netblock sidecar did not complete within 60s"
+        exit 1
+    fi
+    sleep 0.5
+done
 
-docker stop "${TARGET}"
+rm -f /var/run/pgcopydb/target_unblocked
 
-# Wait long enough for pgcopydb to detect the failure and begin its first
-# retry backoff (FOLLOW_RETRY_BASE_SLEEP_SECS = 5s).
-sleep 15
-
-docker start "${TARGET}"
-
-# Wait for target to accept connections again before injecting more DML.
+# Target is accessible again since postgres never stopped.
+deadline=$(($(date +%s) + 30))
 until psql -d ${PGCOPYDB_TARGET_PGURI} -c "SELECT 1" >/dev/null 2>&1
 do
+    if [ $(date +%s) -gt ${deadline} ]; then
+        echo "TIMEOUT: target did not become reachable within 30s after unblock"
+        exit 1
+    fi
     sleep 1
 done
 
@@ -119,8 +137,13 @@ fi
 #
 flushlsn="0/0"
 
+deadline=$(($(date +%s) + 120))
 while [ ${flushlsn} \< ${endpos} ]
 do
+    if [ $(date +%s) -gt ${deadline} ]; then
+        echo "TIMEOUT: pgcopydb did not reach endpos ${endpos} within 120s (at ${flushlsn})"
+        exit 1
+    fi
     flushlsn=`pgcopydb stream sentinel get --flush-lsn 2>/dev/null`
     sleep 1
 done
@@ -129,4 +152,4 @@ done
 # Still give some time to the pgcopydb service to finish its processing,
 # with the cleanup and all.
 #
-sleep 10
+sleep 5

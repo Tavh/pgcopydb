@@ -25,6 +25,18 @@ services:
       -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
       -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
 
+  netblock:
+    build:
+      context: .
+      dockerfile: Dockerfile.netblock
+    network_mode: "service:target"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - follow-target-reconnect:/var/run/pgcopydb
+    depends_on:
+      - target
+
   inject:
     build:
       context: .
@@ -33,11 +45,10 @@ services:
     env_file:
       - ../uris.env
       - ../paths.env
-    # share TMPDIR between inject and test services
-    # Docker socket mounted so inject can stop/start the target container
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - follow-target-reconnect:/var/run/pgcopydb
+    depends_on:
+      - netblock
 
   test:
     image: follow-target-reconnect

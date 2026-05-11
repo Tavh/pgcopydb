@@ -1971,16 +1971,16 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 			if (res == NULL)
 			{
 				/*
-				 * NULL represents end of results for a single query, but in
-				 * pipeline mode there may be more results pending for later
-				 * queries. Normally PQisBusy becomes 1 while the server is
-				 * still processing, so we continue consuming.
+				 * End of results for this statement. In pipeline mode
+				 * there may be more results pending for later statements.
 				 *
-				 * However, if the connection died, PQisBusy stays 0 and
-				 * PQgetResult keeps returning NULL — an infinite spin loop.
-				 * Break out and surface the error instead.
+				 * We must call PQconsumeInput here to update connection
+				 * state: on a dead connection PQisBusy stays 0 and
+				 * PQgetResult returns NULL forever without PQconsumeInput
+				 * being called — an infinite spin loop.
 				 */
-				if (PQstatus(conn) == CONNECTION_BAD)
+				if (PQconsumeInput(conn) == 0 ||
+					PQstatus(conn) == CONNECTION_BAD)
 				{
 					(void) pgcopy_log_error(pgsql, NULL,
 											"connection was lost during pipeline sync");
@@ -1988,7 +1988,11 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 					return false;
 				}
 
-				break;
+				if (PQisBusy(conn) == 0)
+				{
+					continue; /* more results buffered, keep consuming */
+				}
+				break; /* no more buffered; wait for server in outer loop */
 			}
 
 			results++;
@@ -2487,6 +2491,53 @@ pgsql_is_permissions_error(PGSQL *pgsql)
 {
 	return (pgsql->sqlstate[0] == '2' && pgsql->sqlstate[1] == '8') ||
 		   strncmp(pgsql->sqlstate, "42501", 5) == 0;
+}
+
+
+/*
+ * pgsql_is_origin_in_use_error returns true when the last error was
+ * SQLSTATE 55006 (object_in_use), which occurs when another backend
+ * already holds the replication origin session. This is retriable: the
+ * caller should terminate the blocking backend and retry.
+ */
+bool
+pgsql_is_origin_in_use_error(PGSQL *pgsql)
+{
+	return strncmp(pgsql->sqlstate, "55006", 5) == 0;
+}
+
+
+/*
+ * pgsql_terminate_origin_holder terminates the backend that currently
+ * holds the replication origin session for the named origin. Used during
+ * reconnect when the client-side connection was killed but the server-side
+ * backend did not yet detect the dead connection.
+ *
+ * Requires pg_replication_origin_status.active_pid (added in PG 16).
+ * Returns true if the query succeeded (whether or not a backend was found).
+ */
+bool
+pgsql_terminate_origin_holder(PGSQL *pgsql, const char *nodeName)
+{
+	const char *sql =
+		"SELECT pg_terminate_backend(active_pid) "
+		"FROM pg_replication_origin_status "
+		"WHERE external_id = $1 AND active_pid IS NOT NULL";
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { nodeName };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   NULL, NULL))
+	{
+		log_warn("Failed to terminate backend holding replication origin \"%s\"",
+				 nodeName);
+		return false;
+	}
+
+	return true;
 }
 
 

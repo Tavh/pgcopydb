@@ -112,6 +112,16 @@ jobs:
             --load -t pgcopydb:pg${{ matrix.PGVERSION }} \
             -f Dockerfile .
 
+      - name: Build pagila image
+        run: |
+          docker buildx build \
+            --build-arg PGVERSION=${{ matrix.PGVERSION }} \
+            --build-arg PGCOPYDB_IMAGE=pgcopydb:pg${{ matrix.PGVERSION }} \
+            --cache-from type=gha,scope=pagila-pg${{ matrix.PGVERSION }} \
+            --cache-to type=gha,scope=pagila-pg${{ matrix.PGVERSION }},mode=max \
+            --load -t pagila \
+            -f tests/Dockerfile.pagila tests/
+
       - name: Create docker volumes
         run: docker volume create ${TEST}
 

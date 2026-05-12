@@ -1510,7 +1510,7 @@ setupReplicationOrigin(StreamApplyContext *context)
 				 "backend; terminating it and retrying session setup",
 				 nodeName);
 
-		if (pgsql_terminate_origin_holder(&context->controlPgConn, nodeName))
+		if (pgsql_terminate_origin_holder(&context->controlPgConn, applyPgConn, nodeName))
 		{
 			pg_usleep(500 * 1000); /* 500ms for the backend to exit */
 			sessionOk =

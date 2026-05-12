@@ -2508,32 +2508,53 @@ pgsql_is_origin_in_use_error(PGSQL *pgsql)
 
 
 /*
- * pgsql_terminate_origin_holder terminates the backend that currently
- * holds the replication origin session for the named origin. Used during
- * reconnect when the client-side connection was killed but the server-side
- * backend did not yet detect the dead connection.
- *
- * Requires pg_replication_origin_status.active_pid (added in PG 16).
- * Returns true if the query succeeded (whether or not a backend was found).
+ * pgsql_terminate_origin_holder terminates the backend that holds the
+ * replication origin session. The holder PID is extracted from the 55006
+ * error message on applyConn — PostgreSQL includes it verbatim:
+ * "replication origin with ID N is already active for PID N".
+ * This works on all PostgreSQL versions that support replication origins.
  */
 bool
-pgsql_terminate_origin_holder(PGSQL *pgsql, const char *nodeName)
+pgsql_terminate_origin_holder(PGSQL *pgsql, PGSQL *applyConn,
+							  const char *nodeName)
 {
-	const char *sql =
-		"SELECT pg_terminate_backend(active_pid) "
-		"FROM pg_replication_origin_status "
-		"WHERE external_id = $1 AND active_pid IS NOT NULL";
+	const char *errMsg = PQerrorMessage(applyConn->connection);
+	const char *marker = (errMsg != NULL) ? strstr(errMsg, "active for PID ") : NULL;
 
+	if (marker == NULL)
+	{
+		log_warn("Cannot identify backend holding replication origin \"%s\": "
+				 "PID not found in error message",
+				 nodeName);
+		return false;
+	}
+
+	int holderPid = atoi(marker + strlen("active for PID "));
+
+	if (holderPid <= 0)
+	{
+		log_warn("Cannot identify backend holding replication origin \"%s\": "
+				 "parsed PID %d is invalid",
+				 nodeName, holderPid);
+		return false;
+	}
+
+	log_info("Terminating PID %d holding replication origin \"%s\"",
+			 holderPid, nodeName);
+
+	const char *sql = "SELECT pg_terminate_backend($1)";
 	int paramCount = 1;
-	Oid paramTypes[1] = { TEXTOID };
-	const char *paramValues[1] = { nodeName };
+	Oid paramTypes[1] = { INT4OID };
+	char pidStr[12];
+	sformat(pidStr, sizeof(pidStr), "%d", holderPid);
+	const char *paramValues[1] = { pidStr };
 
 	if (!pgsql_execute_with_params(pgsql, sql,
 								   paramCount, paramTypes, paramValues,
 								   NULL, NULL))
 	{
-		log_warn("Failed to terminate backend holding replication origin \"%s\"",
-				 nodeName);
+		log_warn("Failed to terminate PID %d holding replication origin \"%s\"",
+				 holderPid, nodeName);
 		return false;
 	}
 

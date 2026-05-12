@@ -2529,31 +2529,32 @@ pgsql_terminate_origin_holder(PGSQL *pgsql, PGSQL *applyConn,
 		return false;
 	}
 
-	int holderPid = atoi(marker + strlen("active for PID "));
+	char *endptr = NULL;
+	long holderPid = strtol(marker + strlen("active for PID "), &endptr, 10);
 
-	if (holderPid <= 0)
+	if (holderPid <= 0 || endptr == marker + strlen("active for PID "))
 	{
 		log_warn("Cannot identify backend holding replication origin \"%s\": "
-				 "parsed PID %d is invalid",
+				 "parsed PID %ld is invalid",
 				 nodeName, holderPid);
 		return false;
 	}
 
-	log_info("Terminating PID %d holding replication origin \"%s\"",
+	log_info("Terminating PID %ld holding replication origin \"%s\"",
 			 holderPid, nodeName);
 
 	const char *sql = "SELECT pg_terminate_backend($1)";
 	int paramCount = 1;
 	Oid paramTypes[1] = { INT4OID };
 	char pidStr[12];
-	sformat(pidStr, sizeof(pidStr), "%d", holderPid);
+	sformat(pidStr, sizeof(pidStr), "%ld", holderPid);
 	const char *paramValues[1] = { pidStr };
 
 	if (!pgsql_execute_with_params(pgsql, sql,
 								   paramCount, paramTypes, paramValues,
 								   NULL, NULL))
 	{
-		log_warn("Failed to terminate PID %d holding replication origin \"%s\"",
+		log_warn("Failed to terminate PID %ld holding replication origin \"%s\"",
 				 holderPid, nodeName);
 		return false;
 	}

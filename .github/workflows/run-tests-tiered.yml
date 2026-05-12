@@ -139,7 +139,6 @@ jobs:
           - filtering
           - filtering-standby
           - extensions
-          - timescaledb
           - skip-publications
           - skip-vacuum
           - skip-large-objects

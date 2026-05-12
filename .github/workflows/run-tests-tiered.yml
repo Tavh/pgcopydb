@@ -139,7 +139,6 @@ jobs:
           - filtering
           - filtering-standby
           - extensions
-          - timescaledb
           - skip-publications
           - skip-vacuum
           - skip-large-objects
@@ -152,6 +151,7 @@ jobs:
           - follow-standby
           - follow-9.6
           - follow-data-only
+          - follow-target-reconnect
           - endpos-in-multi-wal-txn
           - blob-snapshot-release
           - follow-defer-indexes

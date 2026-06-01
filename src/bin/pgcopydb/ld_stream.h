@@ -133,6 +133,7 @@ typedef struct LogicalMessageValuesArray
 typedef struct LogicalMessageAttribute
 {
 	char *attname; /* malloc'ed area */
+	char *typname; /* malloc'ed area, from wal2json/test_decoding "type" field */
 
 	bool isgenerated;
 } LogicalMessageAttribute;

@@ -145,53 +145,52 @@ fi
 
 #
 # Partitioned-table FK behavior under --defer-validate-fks. The crucial
-# property is that the clone did NOT abort over the partitioned table (we
-# reached this point at all). PostgreSQL cannot create a NOT VALID FK on the
-# partitioned PARENT, so pgcopydb skips that parent-level row; but it still
-# creates the per-partition FK rows directly as NOT VALID, so the partition
-# data is enforced and deferred. Verify exactly that shape.
+# property — and the one that holds across PostgreSQL versions — is that the
+# clone did NOT abort over the partitioned table (we reached this point at
+# all) and that NO foreign key on the partitioned hierarchy was validated
+# (no validation scan ran, which is the whole point of the flag).
 #
-# parent-level row (conrelid = part_child itself) must be absent (skipped)
-tgt_part_parent_fk=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c \
+# The exact shape differs by version:
+#   - PG < 18: PostgreSQL refuses NOT VALID on the partitioned parent, so
+#     pgcopydb skips the parent-level row and creates the per-partition rows
+#     NOT VALID directly.
+#   - PG >= 18: the parent-level NOT VALID FK is supported, so it is created
+#     directly (and propagates NOT VALID to the partitions).
+#
+# Either way: at least one NOT VALID FK row exists for the hierarchy
+# (enforcement is in place) and none are validated.
+#
+part_fk_total=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c \
   "SELECT count(*)
      FROM pg_constraint
     WHERE conname = 'part_child_parent_id_fkey'
-      AND conrelid = 'part_child'::regclass")
+      AND conrelid IN ('part_child'::regclass,
+                       'part_child_2022'::regclass,
+                       'part_child_2023'::regclass)")
 
-# per-partition rows must be present and all NOT VALID
-tgt_part_leaf_fk=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c \
+part_fk_validated=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c \
   "SELECT count(*)
      FROM pg_constraint
     WHERE conname = 'part_child_parent_id_fkey'
-      AND conrelid IN ('part_child_2022'::regclass, 'part_child_2023'::regclass)")
-
-tgt_part_leaf_valid=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c \
-  "SELECT count(*)
-     FROM pg_constraint
-    WHERE conname = 'part_child_parent_id_fkey'
-      AND conrelid IN ('part_child_2022'::regclass, 'part_child_2023'::regclass)
+      AND conrelid IN ('part_child'::regclass,
+                       'part_child_2022'::regclass,
+                       'part_child_2023'::regclass)
       AND convalidated")
 
 tgt_part_rows=$(psql -AtX -d ${PGCOPYDB_TARGET_PGURI} -c "SELECT count(*) FROM part_child")
 
-echo "Target parent-level partitioned FK: ${tgt_part_parent_fk} (expect 0, skipped)"
-echo "Target per-partition FK rows:       ${tgt_part_leaf_fk} (expect 2)"
-echo "  of which validated:               ${tgt_part_leaf_valid} (expect 0)"
-echo "Target part_child rows:             ${tgt_part_rows} (expect 2)"
+echo "Target partitioned-hierarchy FK rows: ${part_fk_total} (expect >= 1)"
+echo "  of which validated:                 ${part_fk_validated} (expect 0)"
+echo "Target part_child rows:               ${tgt_part_rows} (expect 2)"
 
-if [ "${tgt_part_parent_fk}" != "0" ]; then
-    echo "ERROR: parent-level partitioned FK should have been skipped"
-    echo "  (PostgreSQL cannot create it NOT VALID under --defer-validate-fks)"
+if [ "${part_fk_total}" -lt 1 ]; then
+    echo "ERROR: expected at least one NOT VALID FK on the partitioned hierarchy"
     exit 1
 fi
 
-if [ "${tgt_part_leaf_fk}" != "2" ]; then
-    echo "ERROR: expected per-partition FK rows to be created NOT VALID"
-    exit 1
-fi
-
-if [ "${tgt_part_leaf_valid}" != "0" ]; then
-    echo "ERROR: per-partition FKs should all be NOT VALID under defer"
+if [ "${part_fk_validated}" != "0" ]; then
+    echo "ERROR: no partitioned-hierarchy FK should be validated under defer"
+    echo "  (a validation scan ran, which --defer-validate-fks must avoid)"
     exit 1
 fi
 

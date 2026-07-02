@@ -528,6 +528,9 @@ copydb_init_specs(CopyDataSpec *specs,
 		.resume = options->resume,
 		.consistent = !options->notConsistent,
 
+		/* --copy-groups N: number of sequential per-snapshot copy groups */
+		.copyGroups = options->copyGroups,
+
 		.fetchCatalogs = specs->fetchCatalogs,
 
 		/* internal option only, not exposed */

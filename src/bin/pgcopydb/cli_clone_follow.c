@@ -36,6 +36,7 @@
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \
 	"  --split-max-parts             Maximum number of jobs for Same-table concurrency \n" \
+	"  --copy-groups                 Number of sequential table groups to copy under separate snapshots\n" \
 	"  --estimate-table-sizes        Allow using estimates for relation sizes\n" \
 	"  --drop-if-exists              On the target database, clean-up from a previous run first\n" \
 	"  --roles                       Also copy roles found on source to target\n" \
@@ -118,6 +119,25 @@ CommandLine follow_command =
 static void clone_and_follow(CopyDataSpec *copySpecs);
 
 static bool start_clone_process(CopyDataSpec *copySpecs, pid_t *pid);
+
+static bool clone_groups_init_specs(CopyDataSpec *copySpecs,
+									CopyDataSpec *groupSpecs,
+									int groupCount);
+
+static bool clone_groups_copy_phase(CopyDataSpec *copySpecs,
+									CopyDataSpec *groupSpecs,
+									StreamSpecs *streamSpecs,
+									uint64_t *groupThresholdLSN,
+									int groupCount);
+
+static bool clone_groups_barrier_cutover(CopyDataSpec *copySpecs,
+										 CopyDataSpec *groupSpecs,
+										 StreamSpecs *streamSpecs,
+										 uint64_t *groupThresholdLSN,
+										 int groupCount,
+										 pid_t followPID);
+
+static bool start_group_copy_process(CopyDataSpec *groupSpecs, pid_t *pid);
 
 static bool start_follow_process(CopyDataSpec *copySpecs,
 								 StreamSpecs *streamSpecs,
@@ -205,7 +225,30 @@ cli_clone(int argc, char **argv)
 static void
 clone_and_follow(CopyDataSpec *copySpecs)
 {
-	StreamSpecs streamSpecs = { 0 };
+	/*
+	 * --copy-groups is a SINGLE-stream design: one permanent slot and one follow
+	 * triplet, regardless of N. So there is exactly one StreamSpecs. The per-group
+	 * copy thresholds (LSN_g, one per group) are carried in a small uint64 array,
+	 * not in a heavyweight StreamSpecs per group.
+	 */
+	int groupCount = copySpecs->copyGroups >= 1 ? copySpecs->copyGroups : 1;
+
+	StreamSpecs streamSpecsStorage = { 0 };
+	StreamSpecs *streamSpecs = &streamSpecsStorage;
+
+	uint64_t *groupThresholdLSN = NULL;
+
+	if (groupCount > 1)
+	{
+		groupThresholdLSN =
+			(uint64_t *) calloc(groupCount, sizeof(uint64_t));
+
+		if (groupThresholdLSN == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
 
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they
@@ -214,7 +257,16 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 */
 	bool logSQL = log_get_level() <= LOG_TRACE;
 
-	if (!stream_init_specs(&streamSpecs,
+	/*
+	 * The CDC stream is ALWAYS a single stream, even with --copy-groups N > 1:
+	 * one permanent slot decodes all WAL and one follow triplet applies it, with
+	 * a per-group commit-LSN threshold enforcing exactly-once. So element [0] is
+	 * initialised with groupCount = 1 (today's single-stream identity: default
+	 * slot/origin names, the shared source.db catalog). copySpecs->copyGroups
+	 * (N) drives only the copy-phase partitioning and the apply threshold, not
+	 * the stream topology.
+	 */
+	if (!stream_init_specs(streamSpecs,
 						   &(copySpecs->cfPaths.cdc),
 						   &(copySpecs->connStrings),
 						   &(copyDBoptions.slot),
@@ -230,6 +282,14 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	/*
+	 * Carry the real number of copy groups onto the (single) stream so the apply
+	 * context can gate the per-group commit-LSN threshold filter. The stream
+	 * topology stays single (groupCount == 1); copyGroups is only the filter's
+	 * on/off + N. Inert at the single-group default.
+	 */
+	streamSpecs->copyGroups = groupCount;
 
 	/*
 	 * When using pgcopydb clone --follow --restart we first cleanup the
@@ -251,7 +311,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	/*
 	 * First create/export a snapshot for the whole clone --follow operations.
 	 */
-	if (!follow_export_snapshot(copySpecs, &streamSpecs))
+	if (!follow_export_snapshot(copySpecs, streamSpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_SOURCE);
@@ -335,7 +395,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 * Before doing that though, we want to make sure it was possible to setup
 	 * the source and target database for Change Data Capture.
 	 */
-	if (!follow_setup_databases(copySpecs, &streamSpecs))
+	if (!follow_setup_databases(copySpecs, streamSpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -374,35 +434,94 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	}
 
 	/*
+	 * When --copy-groups N (N > 1) is used, initialise the per-group CopyDataSpec
+	 * structs used by the copy phase. No replication slot or snapshot is created
+	 * here; each group's snapshot is exported lazily, immediately before that
+	 * group's copy (and released right after), so the source xmin horizon is only
+	 * ever pinned for the duration of the group currently being copied, not for
+	 * the whole multi-hour run. Skipped at the single-group default.
+	 */
+	CopyDataSpec *groupSpecs = NULL;
+
+	if (groupCount > 1)
+	{
+		groupSpecs =
+			(CopyDataSpec *) calloc(groupCount, sizeof(CopyDataSpec));
+
+		if (groupSpecs == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		if (!clone_groups_init_specs(copySpecs, groupSpecs, groupCount))
+		{
+			/* errors have already been logged */
+			(void) copydb_fatal_exit();
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
+
+	/*
 	 * Preparation and snapshot are now done, time to fork our two main worker
 	 * processes.
 	 */
 	pid_t clonePID = -1;
 	pid_t followPID = -1;
+	bool success = true;
 
-	if (!start_clone_process(copySpecs, &clonePID))
+	if (groupCount > 1)
 	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	if (!start_follow_process(copySpecs, &streamSpecs, &followPID))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	/* wait until the clone process is finished */
-	bool success =
-		cli_clone_follow_wait_subprocess("clone", clonePID, copySpecs);
-
-	/* close our top-level copy db connection and snapshot */
-	if (copySpecs->sourceSnapshot.state != SNAPSHOT_STATE_CLOSED)
-	{
-		if (!copydb_close_snapshot(copySpecs))
+		/*
+		 * --copy-groups N (N > 1): the CDC side is a SINGLE stream (one permanent
+		 * slot, one follow triplet). Start the follow FIRST so its receiver drains
+		 * the permanent slot from its consistent point CONCURRENTLY with the copy
+		 * — this bounds source WAL retention exactly like today's single-group
+		 * clone --follow (apply stays gated until the finalize enables it).
+		 *
+		 * Then drive the per-group copy sequentially: each group is COPYied under
+		 * its own snapshot (group 0 = the permanent slot's; groups 1..N-1 = a
+		 * throwaway slot dropped right after), releasing each snapshot before the
+		 * next group so the source xmin horizon advances across the copy.
+		 */
+		if (!start_follow_process(copySpecs, streamSpecs, &followPID))
 		{
 			/* errors have already been logged */
-			exit(EXIT_CODE_SOURCE);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		success = clone_groups_copy_phase(copySpecs, groupSpecs,
+										  streamSpecs, groupThresholdLSN,
+										  groupCount);
+
+		/* every group's snapshot was closed inside clone_groups_copy_phase */
+	}
+	else
+	{
+		if (!start_clone_process(copySpecs, &clonePID))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		if (!start_follow_process(copySpecs, streamSpecs, &followPID))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		/* wait until the clone process is finished */
+		success =
+			cli_clone_follow_wait_subprocess("clone", clonePID, copySpecs);
+
+		/* close our top-level copy db connection and snapshot */
+		if (copySpecs->sourceSnapshot.state != SNAPSHOT_STATE_CLOSED)
+		{
+			if (!copydb_close_snapshot(copySpecs))
+			{
+				/* errors have already been logged */
+				exit(EXIT_CODE_SOURCE);
+			}
 		}
 	}
 
@@ -426,6 +545,36 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	}
 
 	/*
+	 * --copy-groups N (N > 1): drive the common-LSN barrier and cutover.
+	 *
+	 * Each group was copied as-of its own snapshot's consistent point, so the
+	 * target is not yet cross-group consistent. The barrier (1) builds indexes
+	 * once across the whole DB (apply needs PK/replica-identity for UPDATE/
+	 * DELETE), (2) enables apply per group, (3) drives every group to one
+	 * common source LSN, waits for convergence, then (4) restores FK
+	 * constraints once across the whole DB now that the data is cross-group
+	 * consistent. See clone_groups_barrier_cutover for the full sequencing.
+	 *
+	 * This entirely replaces the single-group deferred-index STEP 10 below at
+	 * N > 1; that path stays exactly as-is for the single-group default.
+	 */
+	if (groupCount > 1)
+	{
+		if (!clone_groups_barrier_cutover(copySpecs,
+										  groupSpecs,
+										  streamSpecs,
+										  groupThresholdLSN,
+										  groupCount,
+										  followPID))
+		{
+			log_error("Failed to reach the common-LSN cutover barrier, "
+					  "see above for details");
+			(void) copydb_fatal_exit();
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
+
+	/*
 	 * When --defer-indexes with --follow, PID B exited after COPY without
 	 * building indexes. Run STEP 10 here so index workers are direct
 	 * children of this process — their semaphores survive CDC failures.
@@ -439,7 +588,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 * accidentally reaped here. PID C is waited on below at the normal
 	 * follow wait.
 	 */
-	if (copySpecs->deferIndexes)
+	if (groupCount == 1 && copySpecs->deferIndexes)
 	{
 		log_info("STEP 10: restore the post-data section to the target database");
 
@@ -514,7 +663,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 */
 	if (success)
 	{
-		if (!follow_reset_sequences(copySpecs, &streamSpecs))
+		if (!follow_reset_sequences(copySpecs, streamSpecs))
 		{
 			/* errors have already been logged */
 			exit(EXIT_CODE_TARGET);
@@ -877,6 +1026,591 @@ cloneDB(CopyDataSpec *copySpecs)
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * clone_groups_init_specs initialises, before any copy starts, the per-group
+ * CopyDataSpec structs used by the copy phase for --copy-groups N (N > 1).
+ *
+ * The CDC stream is a SINGLE stream (one permanent slot, one follow triplet,
+ * per-group commit-LSN threshold on apply), so there is no per-group StreamSpecs
+ * or per-group CDC catalog to set up here. Each group's copy just needs its own
+ * CopyDataSpec carrying its group number (for the copy-queue table filter) and
+ * its own exported snapshot (created lazily in clone_groups_copy_phase): group 0
+ * uses the permanent slot's snapshot, groups 1..N-1 use a throwaway slot.
+ *
+ * This function is only ever called when groupCount > 1; the single-group
+ * default never reaches here.
+ */
+static bool
+clone_groups_init_specs(CopyDataSpec *copySpecs,
+						CopyDataSpec *groupSpecs,
+						int groupCount)
+{
+	/*
+	 * Group 0 reuses the permanent slot's snapshot the caller already exported
+	 * on copySpecs; the other groups start from a wholesale copy of copySpecs
+	 * with the exported-snapshot state cleared so the copy phase can export a
+	 * fresh throwaway snapshot for each.
+	 */
+	groupSpecs[0] = *copySpecs;
+	groupSpecs[0].currentCopyGroup = 0;
+
+	for (int g = 1; g < groupCount; g++)
+	{
+		groupSpecs[g] = *copySpecs;
+		groupSpecs[g].currentCopyGroup = g;
+
+		/*
+		 * Clear the exported-snapshot STATE inherited from group 0 while
+		 * preserving the connection identity (pguri / connectionType) that slot
+		 * creation's standby-recovery check needs. A bare { 0 } here would NULL
+		 * out sourceSnapshot.pguri and crash that check.
+		 */
+		TransactionSnapshot freshSnapshot = { 0 };
+		freshSnapshot.pguri = copySpecs->connStrings.source_pguri;
+		freshSnapshot.safeURI = copySpecs->connStrings.safeSourcePGURI;
+		freshSnapshot.connectionType = PGSQL_CONN_SOURCE;
+		freshSnapshot.isReadOnly = copySpecs->sourceSnapshot.isReadOnly;
+		groupSpecs[g].sourceSnapshot = freshSnapshot;
+	}
+
+	return true;
+}
+
+
+/*
+ * start_group_copy_process forks a copy-only sub-process that COPYs a single
+ * copy group's table subset (groupSpecs->currentCopyGroup) under that group's
+ * snapshot. Schema dump and pre-data restore have already been done once by the
+ * parent before the per-group loop; this child only fills the COPY queue (whose
+ * iterator skips tables not assigned to this group) and runs the COPY workers.
+ */
+static bool
+start_group_copy_process(CopyDataSpec *groupSpecs, pid_t *pid)
+{
+	fflush(stdout);
+	fflush(stderr);
+
+	pid_t fpid = fork();
+
+	switch (fpid)
+	{
+		case -1:
+		{
+			log_error("Failed to fork a copy sub-process for group %d: %m",
+					  groupSpecs->currentCopyGroup);
+			return false;
+		}
+
+		case 0:
+		{
+			char title[BUFSIZE] = { 0 };
+
+			sformat(title, sizeof(title),
+					"pgcopydb: copy group %d", groupSpecs->currentCopyGroup);
+
+			(void) set_ps_title(title);
+
+			log_info("Copying table data for group %d", groupSpecs->currentCopyGroup);
+
+			/*
+			 * Open this child's own SQLite catalog connection. The parent closed
+			 * the catalogs before forking (so each child gets a fresh
+			 * connection), and copydb_copy_all_table_data starts by recording a
+			 * timing row (summary_start_timing), which requires an open catalog.
+			 * The schema rows are already populated by the parent's
+			 * copydb_fetch_schema_and_prepare_specs; this child only reads/uses
+			 * them, so a plain open (no re-fetch) is enough.
+			 */
+			if (!catalog_open_from_specs(groupSpecs))
+			{
+				log_error("Failed to open catalogs for group %d copy",
+						  groupSpecs->currentCopyGroup);
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			/*
+			 * Re-derive a process-local SQL snapshot from this group's exported
+			 * snapshot string, mirroring cloneDB: the COPY workers each then
+			 * SET TRANSACTION SNAPSHOT to it. This avoids the child operating on
+			 * the parent's inherited logical-replication snapshot connection.
+			 */
+			TransactionSnapshot snapshot = { 0 };
+
+			if (!copydb_copy_snapshot(groupSpecs, &snapshot))
+			{
+				log_error("Failed to copy snapshot for group %d",
+						  groupSpecs->currentCopyGroup);
+				exit(EXIT_CODE_SOURCE);
+			}
+
+			groupSpecs->sourceSnapshot = snapshot;
+
+			if (!copydb_copy_all_table_data(groupSpecs))
+			{
+				log_error("Failed to copy data for group %d, "
+						  "see above for details",
+						  groupSpecs->currentCopyGroup);
+				exit(EXIT_CODE_SOURCE);
+			}
+
+			exit(EXIT_CODE_QUIT);
+		}
+
+		default:
+		{
+			*pid = fpid;
+			return true;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * clone_groups_copy_phase runs the per-group COPY sequentially when
+ * --copy-groups N (N > 1) is used. The parent dumps the schema and restores the
+ * pre-data section once (under group 0's snapshot), then for each group it:
+ *
+ *   1. creates that group's replication slot + exported snapshot (lazily, for
+ *      groups 1..N-1; group 0's was created up front by the caller and is also
+ *      used for the schema dump above),
+ *   2. forks a copy-only sub-process scoped to that group's table subset,
+ *   3. waits for it to finish, and
+ *   4. closes that group's snapshot before moving on to the next group.
+ *
+ * Creating each group's snapshot immediately before its copy and releasing it
+ * immediately after is what lets the source xmin horizon advance between
+ * groups: at any moment only the group currently being copied pins the
+ * horizon, instead of all N snapshots pinning it from the start. The group
+ * slots persist after their snapshot is released (the caller starts the follow
+ * supervisor over all N slots once this function returns).
+ *
+ * Only ever called when groupCount > 1.
+ */
+static bool
+clone_groups_copy_phase(CopyDataSpec *copySpecs,
+						CopyDataSpec *groupSpecs,
+						StreamSpecs *streamSpecs,
+						uint64_t *groupThresholdLSN,
+						int groupCount)
+{
+	/*
+	 * Group 0's threshold is the permanent slot's consistent point (LSN_0),
+	 * already exported by the caller onto the single stream.
+	 */
+	groupThresholdLSN[0] = streamSpecs->slot.lsn;
+
+	/*
+	 * The caller closed the catalogs before this point (so each forked
+	 * sub-process gets its own SQLite connection). Schema dump and pre-data
+	 * restore run here in the parent and need the catalog open for their
+	 * timing/restore-list bookkeeping, so reopen it for that work and close it
+	 * again before the per-group COPY children fork (copydb_copy_all_table_data
+	 * manages the catalog open/close around its own fork).
+	 */
+	if (!catalog_open_from_specs(copySpecs))
+	{
+		log_error("Failed to open catalogs for multi-group schema dump");
+		return false;
+	}
+
+	/*
+	 * Schema dump and pre-data restore happen once, whole-DB, under group 0's
+	 * snapshot. The per-group COPY children below assume the target schema is
+	 * already in place. (Post-data finalize across all groups, the common-LSN
+	 * barrier and the FK-constraint phase are PR6.)
+	 */
+	log_info("STEP 2: dump the source database schema (pre/post data)");
+
+	if (!copydb_dump_source_schema(copySpecs,
+								   copySpecs->sourceSnapshot.snapshot))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	log_info("STEP 3: restore the pre-data section to the target database");
+
+	if (!copydb_target_prepare_schema(copySpecs))
+	{
+		log_error("Failed to prepare schema on the target database, "
+				  "see above for details");
+		return false;
+	}
+
+	if (!catalog_close_from_specs(copySpecs))
+	{
+		log_warn("Failed to close catalogs before per-group copy fork");
+	}
+
+	for (int g = 0; g < groupCount; g++)
+	{
+		pid_t copyPID = -1;
+		char tmpSlotName[BUFSIZE] = { 0 };
+
+		/*
+		 * Obtain this group's consistent snapshot immediately before its copy,
+		 * so the snapshot pins the source xmin horizon only for the duration of
+		 * this group's copy (not the whole run).
+		 *
+		 * Group 0 uses the ONE permanent CDC slot's snapshot (already exported
+		 * by the caller and used for the schema dump above); its consistent
+		 * point LSN_0 is the earliest and its threshold. Groups 1..N-1 create a
+		 * throwaway slot ONLY to get an exact (snapshot, consistent point LSN_g)
+		 * pair; the permanent slot's stream carries every group's changes, so
+		 * these slots are dropped right after the copy. LSN_g is recorded (into
+		 * the in-memory slot) and later persisted as this group's apply
+		 * threshold.
+		 */
+		if (g >= 1)
+		{
+			ReplicationSlot tmpSlot = { 0 };
+
+			sformat(tmpSlotName, sizeof(tmpSlotName),
+					"%s_cgtmp_g%d", copyDBoptions.slot.slotName, g);
+
+			log_info("STEP 4: export a snapshot for group %d of %d "
+					 "(temporary slot \"%s\")", g, groupCount, tmpSlotName);
+
+			if (!copydb_export_snapshot_temp_slot(
+					&(groupSpecs[g]),
+					tmpSlotName,
+					streamSpecs->slot.plugin,
+					&tmpSlot))
+			{
+				log_error("Failed to export snapshot for group %d", g);
+				return false;
+			}
+
+			groupThresholdLSN[g] = tmpSlot.lsn;
+
+			log_info("Group %d copy threshold LSN is %X/%X", g,
+					 LSN_FORMAT_ARGS(groupThresholdLSN[g]));
+		}
+
+		log_info("STEP 4: COPY the data for group %d of %d", g, groupCount);
+
+		if (!start_group_copy_process(&(groupSpecs[g]), &copyPID))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!cli_clone_follow_wait_subprocess("clone", copyPID,
+											  &(groupSpecs[g])))
+		{
+			log_error("Failed to copy data for group %d, see above for details",
+					  g);
+			return false;
+		}
+
+		/*
+		 * Release this group's snapshot so the source xmin horizon advances
+		 * before the next group's copy. Group 0 closes the permanent slot's
+		 * exported snapshot but keeps the slot (the single CDC stream needs it);
+		 * groups 1..N-1 close their snapshot AND drop the throwaway slot so the
+		 * source can reclaim the WAL it was retaining.
+		 */
+		if (g == 0)
+		{
+			/*
+			 * Group 0 shares the permanent slot's snapshot with copySpecs
+			 * (same underlying walsender connection). cli_clone_follow_wait_
+			 * subprocess above may have already released it early via its
+			 * copySpecs param (== &groupSpecs[0]), so check groupSpecs[0]'s
+			 * state — NOT copySpecs' (a separate struct that still reads
+			 * EXPORTED) — to avoid a second copydb_close_snapshot on the same
+			 * already-finished connection (double PQfinish -> heap corruption).
+			 * Then reflect CLOSED on copySpecs so nothing closes it again.
+			 */
+			if (groupSpecs[0].sourceSnapshot.state != SNAPSHOT_STATE_CLOSED)
+			{
+				if (!copydb_close_snapshot(&(groupSpecs[0])))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+			}
+			copySpecs->sourceSnapshot.state = SNAPSHOT_STATE_CLOSED;
+		}
+		else
+		{
+			if (!copydb_drop_temp_slot(&(groupSpecs[g]), tmpSlotName))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
+
+		log_info("Closed snapshot for group %d, xmin horizon can advance", g);
+	}
+
+	return true;
+}
+
+
+/*
+ * clone_groups_barrier_cutover finalizes a --copy-groups N (N > 1) migration.
+ * It runs in the parent after every group's COPY has completed and the SINGLE
+ * follow triplet (one permanent slot) is already running with apply gated off.
+ *
+ * The single-stream design makes cross-group consistency automatic: there is
+ * one apply position, and every table on the target equals COPY(as-of LSN_g)
+ * plus the stream's changes with commit LSN > LSN_g. Once the one apply position
+ * passes the largest group's copy point, the target reflects the source's
+ * transactionally consistent state. So the elaborate per-group common-LSN
+ * synchronization is unnecessary; this collapses to today's single-stream
+ * deferred-index finalize, plus recording the per-group apply thresholds:
+ *
+ *   1. Build indexes ONCE across the whole database (apply needs PK / replica
+ *      identity for UPDATE/DELETE lookups). FK constraints are NOT built here.
+ *
+ *   2. Persist each group's copy threshold LSN_g (from its snapshot's consistent
+ *      point), which the apply's per-group commit-LSN filter reads to apply each
+ *      change exactly once. Thresholds MUST be written before apply is enabled.
+ *
+ *   3. Enable apply on the single sentinel and drive the stream to a common
+ *      cutover LSN (the source's current flush LSN, necessarily >= every group's
+ *      copy point). Wait until the single apply reaches it.
+ *
+ *   4. Once apply is quiescent at that LSN the target is cross-group consistent,
+ *      so restore FK constraints ONCE across the whole DB (existing NOT VALID +
+ *      retry validation now passes).
+ */
+static bool
+clone_groups_barrier_cutover(CopyDataSpec *copySpecs,
+							 CopyDataSpec *groupSpecs,
+							 StreamSpecs *streamSpecs,
+							 uint64_t *groupThresholdLSN,
+							 int groupCount,
+							 pid_t followPID)
+{
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
+
+	/*
+	 * STEP 1: build indexes (incl. PK / replica identity) ONCE, whole-DB. FK
+	 * constraints are restored later (STEP 4), after apply has caught up and the
+	 * target is cross-group consistent.
+	 */
+	log_info("STEP 10: build indexes across all %d copy groups (whole database)",
+			 groupCount);
+
+	if (!catalog_open_from_specs(copySpecs))
+	{
+		log_error("Failed to open catalogs for whole-DB index build");
+		return false;
+	}
+
+	if (!copydb_target_finalize_schema_indexes(copySpecs))
+	{
+		log_error("Failed to build indexes, see above for details");
+		(void) catalog_close_from_specs(copySpecs);
+		return false;
+	}
+
+	if (copySpecs->deferAnalyze)
+	{
+		log_info("Running deferred ANALYZE on target database");
+
+		if (!pg_vacuumdb_analyze_only_target(&(copySpecs->pgPaths),
+											 &(copySpecs->connStrings),
+											 copySpecs->tableJobs))
+		{
+			log_warn("Failed to run deferred ANALYZE, "
+					 "run vacuumdb --analyze-only manually before cutover");
+		}
+	}
+
+	/*
+	 * STEP 2: persist each group's copy threshold LSN_g (recorded by the copy
+	 * phase in groupThresholdLSN[]) so the single apply's per-group commit-LSN
+	 * filter can enforce exactly-once. groupThresholdLSN[0] is the permanent
+	 * slot's consistent point; [g] (g >= 1) is each group's temporary-slot
+	 * consistent point. Thresholds MUST be written before apply is enabled.
+	 */
+	for (int g = 0; g < groupCount; g++)
+	{
+		if (!catalog_set_group_lsn(sourceDB, g, groupThresholdLSN[g]))
+		{
+			log_error("Failed to persist copy threshold for group %d", g);
+			(void) catalog_close_from_specs(copySpecs);
+			return false;
+		}
+
+		log_info("Group %d apply threshold LSN is %X/%X", g,
+				 LSN_FORMAT_ARGS(groupThresholdLSN[g]));
+	}
+
+	if (!catalog_close_from_specs(copySpecs))
+	{
+		log_warn("Failed to close catalogs after whole-DB index build");
+	}
+
+	/*
+	 * STEP 3: enable apply on the single stream and drive it to a common cutover
+	 * LSN (the source's current flush LSN, >= every group's copy point).
+	 */
+	uint64_t commonLSN = InvalidXLogRecPtr;
+
+	if (!stream_fetch_current_lsn(&commonLSN,
+								  copySpecs->connStrings.source_pguri,
+								  PGSQL_CONN_SOURCE))
+	{
+		log_error("Failed to fetch the common cutover LSN from the source");
+		return false;
+	}
+
+	log_info("Common cutover LSN is %X/%X", LSN_FORMAT_ARGS(commonLSN));
+
+	if (!catalog_open(streamSpecs->sourceDB))
+	{
+		log_error("Failed to open catalog to enable apply at cutover");
+		return false;
+	}
+
+	if (!sentinel_update_apply(streamSpecs->sourceDB, true))
+	{
+		log_error("Failed to enable apply");
+		(void) catalog_close(streamSpecs->sourceDB);
+		return false;
+	}
+
+	if (!sentinel_update_endpos(streamSpecs->sourceDB, commonLSN))
+	{
+		log_error("Failed to set the cutover endpos");
+		(void) catalog_close(streamSpecs->sourceDB);
+		return false;
+	}
+
+	streamSpecs->endpos = commonLSN;
+
+	/*
+	 * Wait until the single apply reaches the cutover LSN. If the follow process
+	 * dies before that, bail rather than loop forever.
+	 */
+	log_info("Waiting for apply to reach the cutover LSN %X/%X",
+			 LSN_FORMAT_ARGS(commonLSN));
+
+	/*
+	 * Keep the source producing WAL past commonLSN while we wait. On an
+	 * otherwise-idle source the replication slot never flushes THROUGH
+	 * commonLSN (no new WAL records to receive), so the apply would wait for an
+	 * endpos it can never observe and cutover would hang. A lightweight logical
+	 * message every couple of seconds guarantees forward progress; it writes no
+	 * user data and is a no-op the apply ignores.
+	 */
+	PGSQL nudge = { 0 };
+	bool nudgeReady =
+		pgsql_init(&nudge, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE);
+	int iterations = 0;
+
+	bool converged = false;
+
+	while (!converged)
+	{
+		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		{
+			log_warn("Interrupted while waiting for apply to reach cutover");
+			(void) catalog_close(streamSpecs->sourceDB);
+			(void) pgsql_finish(&nudge);
+			return false;
+		}
+
+		if (!follow_reached_endpos(streamSpecs, &converged))
+		{
+			log_error("Failed to check apply progress, see above");
+			(void) catalog_close(streamSpecs->sourceDB);
+			(void) pgsql_finish(&nudge);
+			return false;
+		}
+
+		if (converged)
+		{
+			break;
+		}
+
+		if (followPID > 0)
+		{
+			bool exited = false;
+			int returnCode = -1;
+			int sig = 0;
+
+			if (!follow_wait_pid(followPID, &exited, &returnCode, &sig))
+			{
+				/* errors have already been logged */
+				(void) catalog_close(streamSpecs->sourceDB);
+				(void) pgsql_finish(&nudge);
+				return false;
+			}
+
+			if (exited)
+			{
+				log_error("Follow process exited [%d] before apply reached the "
+						  "cutover LSN %X/%X",
+						  returnCode, LSN_FORMAT_ARGS(commonLSN));
+				(void) catalog_close(streamSpecs->sourceDB);
+				(void) pgsql_finish(&nudge);
+				return false;
+			}
+		}
+
+		/* every ~2s (8 * 250ms), nudge the source WAL forward (best-effort) */
+		if (nudgeReady && (iterations % 8) == 0)
+		{
+			char *sql =
+				"select pg_logical_emit_message(false, 'pgcopydb', 'cutover')";
+
+			if (!pgsql_execute(&nudge, sql))
+			{
+				log_warn("Failed to emit a WAL keepalive message on the source; "
+						 "cutover relies on source write traffic to reach the "
+						 "cutover LSN");
+				nudgeReady = false;
+			}
+		}
+		iterations++;
+
+		/* avoid busy looping */
+		pg_usleep(250 * 1000);
+	}
+
+	(void) pgsql_finish(&nudge);
+
+	log_info("Apply has reached the cutover LSN %X/%X",
+			 LSN_FORMAT_ARGS(commonLSN));
+
+	(void) catalog_close(streamSpecs->sourceDB);
+
+	/*
+	 * STEP 4: the target is now cross-group consistent at the cutover LSN and
+	 * apply is quiescent, so restore FK constraints ONCE across the whole DB.
+	 */
+	log_info("Restoring FK constraints across all %d copy groups (whole database)",
+			 groupCount);
+
+	if (!catalog_open_from_specs(copySpecs))
+	{
+		log_error("Failed to open catalogs for whole-DB FK constraint restore");
+		return false;
+	}
+
+	if (!copydb_target_finalize_schema_constraints(copySpecs))
+	{
+		log_error("Failed to restore FK constraints, see above for details");
+		(void) catalog_close_from_specs(copySpecs);
+		return false;
+	}
+
+	if (!catalog_close_from_specs(copySpecs))
+	{
+		log_warn("Failed to close catalogs after FK constraint restore");
 	}
 
 	return true;

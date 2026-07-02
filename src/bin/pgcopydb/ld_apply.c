@@ -61,13 +61,15 @@ static bool parseTxnMetadataFile(const char *filename, LogicalMessageMetadata *m
 
 static bool computeTxnMetadataFilename(uint32_t xid, const char *dir, char *filename);
 
-static bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir);
-
 static bool setupConnection(PGSQL *pgsql, StreamApplyContext *context);
 
 static bool extractTableNameFromPrepare(const char *stmt,
 										char *nspname, size_t nspnameSize,
 										char *relname, size_t relnameSize);
+
+static bool shouldSkipChangeByThreshold(StreamApplyContext *context,
+										const char *nspname, const char *relname,
+										bool *ok);
 
 /*
  * stream_apply_catchup catches up with SQL files that have been prepared by
@@ -243,6 +245,15 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 	}
 
 	context->logSQL = specs->logSQL;
+
+	/*
+	 * Carry the real number of copy groups onto the apply context. The CDC
+	 * stream is always single; copyGroups (the real N) gates the per-group
+	 * commit-LSN threshold filter that enforces exactly-once apply across
+	 * groups. At the single-group default (copyGroups <= 1) the filter is inert
+	 * and apply behaves byte-for-byte as today.
+	 */
+	context->copyGroups = specs->copyGroups;
 
 	/* wait until the sentinel enables the apply process */
 	if (!stream_apply_wait_for_sentinel(specs, context))
@@ -701,6 +712,15 @@ stream_apply_sql(StreamApplyContext *context,
 			 * abort.
 			 */
 			context->continuedTxn = !txnCommitLSNFound;
+
+			/*
+			 * Remember this transaction's commit LSN for the --copy-groups
+			 * per-group threshold filter applied to its changes. When the commit
+			 * LSN is unknown (continuedTxn, txn spanning WAL segments) leave it
+			 * Invalid so the filter errs toward applying rather than skipping.
+			 */
+			context->currentTxnCommitLSN =
+				txnCommitLSNFound ? metadata->txnCommitLSN : InvalidXLogRecPtr;
 
 			/* did we reach the starting LSN positions now? */
 			if (!context->reachedStartPos)
@@ -1254,6 +1274,29 @@ stream_apply_sql(StreamApplyContext *context,
 				return true;
 			}
 
+			/*
+			 * --copy-groups: skip this change when its transaction committed at
+			 * or before its table's copy group threshold LSN_g (already captured
+			 * in the COPY). Inert at copyGroups <= 1. A false ok means the
+			 * decision could not be made safely -> abort rather than risk a
+			 * duplicate/lost apply.
+			 */
+			{
+				bool ok = true;
+
+				if (stmt != NULL &&
+					shouldSkipChangeByThreshold(context, stmt->nspname,
+												stmt->relname, &ok))
+				{
+					return true;
+				}
+
+				if (!ok)
+				{
+					return false;
+				}
+			}
+
 			char name[NAMEDATALEN] = { 0 };
 			sformat(name, sizeof(name), "%x", metadata->hash);
 
@@ -1350,6 +1393,27 @@ stream_apply_sql(StreamApplyContext *context,
 			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
+			}
+
+			/*
+			 * --copy-groups: a TRUNCATE is applied directly from the SQL file
+			 * (not via PREPARE/EXECUTE), so it must consult the per-group
+			 * threshold here too, or a TRUNCATE already captured in the group's
+			 * COPY would replay and wipe copied rows.
+			 */
+			{
+				bool ok = true;
+
+				if (shouldSkipChangeByThreshold(context, metadata->nspname,
+												metadata->relname, &ok))
+				{
+					return true;
+				}
+
+				if (!ok)
+				{
+					return false;
+				}
 			}
 
 			/* chomp the final semi-colon that we added */
@@ -1816,6 +1880,178 @@ extractTableNameFromPrepare(const char *stmt,
 
 
 /*
+ * groupThresholdForTable resolves (and caches on the apply context) the copy
+ * group and its threshold LSN_g for a table under --copy-groups: the consistent
+ * point at which that group was COPYied. It maps name -> oid (s_table) -> group
+ * number (s_table_group_assignment) -> LSN_g (s_group_lsn) once per table; the
+ * result is cached on context->groupThresholdCache so it survives across
+ * transactions (PreparedStmt entries are freed every COMMIT).
+ *
+ * Returns false on an unrecoverable inconsistency (catalog query error, or a
+ * group > 0 with no recorded threshold LSN); the caller must then abort rather
+ * than risk a duplicate/lost apply. A table with no s_table row (a catalog /
+ * system table) resolves to group 0 / threshold 0 ("apply everything"), which is
+ * safe: group 0 is anchored at the earliest consistent point.
+ */
+static bool
+groupThresholdForTable(StreamApplyContext *context,
+					   const char *nspname, const char *relname,
+					   int *groupNumber, uint64_t *thresholdLSN)
+{
+	char key[2 * PG_NAMEDATALEN + 1] = { 0 };
+	sformat(key, sizeof(key), "%s.%s", nspname, relname);
+
+	GroupThresholdEntry *entry = NULL;
+	HASH_FIND_STR(context->groupThresholdCache, key, entry);
+
+	if (entry != NULL)
+	{
+		*groupNumber = entry->groupNumber;
+		*thresholdLSN = entry->thresholdLSN;
+		return true;
+	}
+
+	int g = 0;
+	uint64_t lsn = InvalidXLogRecPtr;
+
+	if (context->sourceDB != NULL)
+	{
+		SourceTable table = { 0 };
+
+		if (!catalog_lookup_s_table_by_name(context->sourceDB,
+											nspname, relname, &table))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (table.oid != 0)
+		{
+			if (!catalog_lookup_s_table_group_number(context->sourceDB,
+													 table.oid, &g))
+			{
+				return false;
+			}
+
+			if (g != 0)
+			{
+				if (!catalog_lookup_group_lsn(context->sourceDB, g, &lsn))
+				{
+					return false;
+				}
+
+				if (lsn == InvalidXLogRecPtr)
+				{
+					log_error("BUG: copy group %d has no recorded threshold LSN "
+							  "for table \"%s\".\"%s\"", g, nspname, relname);
+					return false;
+				}
+			}
+		}
+	}
+
+	entry = (GroupThresholdEntry *) calloc(1, sizeof(GroupThresholdEntry));
+
+	if (entry == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	strlcpy(entry->key, key, sizeof(entry->key));
+	entry->groupNumber = g;
+	entry->thresholdLSN = lsn;
+	HASH_ADD_STR(context->groupThresholdCache, key, entry);
+
+	*groupNumber = g;
+	*thresholdLSN = lsn;
+
+	return true;
+}
+
+
+/*
+ * shouldSkipChangeByThreshold implements the apply-side half of --copy-groups N.
+ * The single stream decodes all WAL; a change to a group-g table must be applied
+ * EXACTLY ONCE. Changes whose transaction committed at or before that group's
+ * copy point LSN_g are already in the COPY, so they are skipped; changes
+ * committed strictly after LSN_g are applied. This is the exact same cut a
+ * dedicated slot created at LSN_g would make.
+ *
+ * Returns true when the change should be SKIPPED. Sets *ok = false when the
+ * decision cannot be made safely for a group > 0 (catalog inconsistency, or an
+ * unknown transaction commit LSN for a skippable group), in which case the
+ * caller MUST abort the apply rather than risk duplicating or losing data.
+ *
+ * Inert at copyGroups <= 1 and for group 0 (threshold 0): everything applies.
+ */
+static bool
+shouldSkipChangeByThreshold(StreamApplyContext *context,
+							const char *nspname, const char *relname,
+							bool *ok)
+{
+	*ok = true;
+
+	if (context->copyGroups <= 1)
+	{
+		return false;
+	}
+
+	/* no table name available (should not happen for DML/TRUNCATE): apply */
+	if (nspname == NULL || nspname[0] == '\0')
+	{
+		return false;
+	}
+
+	int groupNumber = 0;
+	uint64_t thresholdLSN = InvalidXLogRecPtr;
+
+	if (!groupThresholdForTable(context, nspname, relname,
+								&groupNumber, &thresholdLSN))
+	{
+		*ok = false;
+		return false;
+	}
+
+	/* group 0 is anchored at the earliest consistent point: never skip */
+	if (groupNumber == 0)
+	{
+		return false;
+	}
+
+	/*
+	 * A group > 0 change we cannot place relative to LSN_g (unknown commit LSN,
+	 * e.g. a continued multi-WAL-segment transaction whose commit metadata was
+	 * not recorded) is unsafe to either apply (possible duplicate on top of the
+	 * COPY) or skip (possible lost change). Fail closed so the operator sees a
+	 * clear error instead of silent divergence.
+	 */
+	if (context->currentTxnCommitLSN == InvalidXLogRecPtr)
+	{
+		log_error("Cannot determine transaction commit LSN for a change to "
+				  "\"%s\".\"%s\" in copy group %d; aborting to avoid a duplicate "
+				  "or lost apply (continued transaction with no recorded commit "
+				  "LSN)", nspname, relname, groupNumber);
+		*ok = false;
+		return false;
+	}
+
+	if (context->currentTxnCommitLSN <= thresholdLSN)
+	{
+		log_trace("Skipping change to \"%s\".\"%s\": txn commit %X/%X <= "
+				  "group %d copy threshold %X/%X (already in COPY)",
+				  nspname, relname,
+				  LSN_FORMAT_ARGS(context->currentTxnCommitLSN),
+				  groupNumber,
+				  LSN_FORMAT_ARGS(thresholdLSN));
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
  * shouldFilterOutTable checks if a given table should be filtered out based
  * on the configured filters.
  *
@@ -2103,7 +2339,12 @@ parseSQLAction(const char *query, LogicalMessageMetadata *metadata,
 			strlcpy(relname, schema, sizeof(relname));
 		}
 
-		/* Check if this table should be filtered out */
+		/* remember the table so the apply can consult the --copy-groups
+		 * threshold for this TRUNCATE (applied directly, not via EXECUTE) */
+		strlcpy(metadata->nspname, nspname, sizeof(metadata->nspname));
+		strlcpy(metadata->relname, relname, sizeof(metadata->relname));
+
+		/* Check if this table should be filtered out (user filters.ini) */
 		if (shouldFilterOutTable(nspname, relname, filters))
 		{
 			metadata->filterOut = true;
@@ -2391,9 +2632,11 @@ computeTxnMetadataFilename(uint32_t xid, const char *dir, char *filename)
 
 /*
  * writeTxnCommitMetadata writes the transaction metadata to a file in the given
- * directory
+ * directory. Exposed so the transform can pre-write it for continued (multi-WAL
+ * segment) transactions under --copy-groups, letting the apply resolve their
+ * commit LSN at BEGIN for the per-group threshold filter.
  */
-static bool
+bool
 writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir)
 {
 	char txnfilename[MAXPGPATH] = { 0 };

@@ -86,6 +86,10 @@ stream_transform_context_init(StreamSpecs *specs)
 {
 	StreamContext *privateContext = &(specs->private);
 
+	/* carry the copy-group count so the transform can pre-write commit-LSN
+	 * metadata for continued transactions under --copy-groups (inert at <= 1) */
+	privateContext->copyGroups = specs->copyGroups;
+
 	privateContext->transformPGSQL = &(specs->transformPGSQL);
 
 	/* initialize our connection to the target database */
@@ -198,9 +202,35 @@ stream_transform_stream_internal(StreamSpecs *specs)
 
 	if (!read_from_stream(privateContext->in, &context))
 	{
-		log_error("Failed to transform JSON messages from input stream, "
-				  "see above for details");
-		return false;
+		/*
+		 * When the apply process reaches endpos it exits and closes the read
+		 * end of our output pipe. If we were still writing trailing messages
+		 * we get EPIPE (pipelineBroken). That is an expected, clean shutdown
+		 * when endpos has been reached for the last message we processed: the
+		 * downstream is done on purpose, not crashed.
+		 *
+		 * We only treat EPIPE as clean when endpos is set AND the last message
+		 * we handled is at or past it. In every other case (endpos unset, or
+		 * not yet reached) a broken pipe means the downstream died
+		 * unexpectedly and we must report failure. A genuine downstream crash
+		 * is also caught independently by the apply process's own non-zero
+		 * exit at the follow supervisor.
+		 */
+		if (privateContext->pipelineBroken &&
+			privateContext->endpos != InvalidXLogRecPtr &&
+			privateContext->endpos <= privateContext->metadata.lsn)
+		{
+			log_info("Apply process reached endpos %X/%X and closed the pipe; "
+					 "transform stopping cleanly at %X/%X",
+					 LSN_FORMAT_ARGS(privateContext->endpos),
+					 LSN_FORMAT_ARGS(privateContext->metadata.lsn));
+		}
+		else
+		{
+			log_error("Failed to transform JSON messages from input stream, "
+					  "see above for details");
+			return false;
+		}
 	}
 
 	/* we might have stopped reading mid-file, let's close it. */
@@ -478,6 +508,27 @@ stream_transform_write_message(StreamContext *privateContext,
 	{
 		/* now write the COMMIT message even when txn is continued */
 		txn->commit = true;
+
+		/*
+		 * --copy-groups N (N > 1): for a CONTINUED transaction (its BEGIN was
+		 * flushed to an earlier SQL file, before this COMMIT was seen), the
+		 * BEGIN line carries no commit LSN, so the apply would treat it as a
+		 * continuedTxn with an unknown commit LSN and could not apply the
+		 * per-group threshold to its changes. Pre-write the commit-LSN metadata
+		 * file (keyed by xid) here, where we now know the commit LSN, so the
+		 * apply resolves it at BEGIN and the threshold is exact. Inert at
+		 * N <= 1, and harmless for non-continued txns (whose BEGIN already
+		 * carries the commit LSN), so we only do it for continued ones.
+		 */
+		if (privateContext->copyGroups > 1 && txn->continued &&
+			metadata->xid != 0)
+		{
+			if (!writeTxnCommitMetadata(metadata, privateContext->paths.dir))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
 	}
 
 	/*
@@ -503,6 +554,18 @@ stream_transform_write_message(StreamContext *privateContext,
 	{
 		if (!stream_write_message(privateContext->out, currentMsg))
 		{
+			/*
+			 * A broken downstream pipe (EPIPE) is expected when the apply
+			 * process has reached endpos and exited: it closes its read end
+			 * while we might still be writing trailing messages. Record that
+			 * so the caller can decide whether this is a clean endpos
+			 * shutdown or a genuine failure. See stream_transform_stream().
+			 */
+			if (errno == EPIPE)
+			{
+				privateContext->pipelineBroken = true;
+			}
+
 			/* errors have already been logged */
 			return false;
 		}

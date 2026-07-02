@@ -219,6 +219,7 @@ cli_copydb_getenv(CopyDBOptions *options)
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
 	options->restoreOptions.restoreTolerance = DEFAULT_RESTORE_TOLERANCE;
+	options->copyGroups = DEFAULT_COPY_GROUPS;
 
 	EnvParser parsers[] = {
 		{ PGCOPYDB_TABLE_JOBS, ENV_TYPE_INT,
@@ -231,6 +232,8 @@ cli_copydb_getenv(CopyDBOptions *options)
 		  &(options->lObjectJobs), 0, true, 1, true, 128 },
 		{ PGCOPYDB_SPLIT_MAX_PARTS, ENV_TYPE_INT,
 		  &(options->splitMaxParts), 0, true, 1 },
+		{ PGCOPYDB_COPY_GROUPS, ENV_TYPE_INT,
+		  &(options->copyGroups), 0, true, 1 },
 		{ PGCOPYDB_ESTIMATE_TABLE_SIZES, ENV_TYPE_BOOL,
 		  &(options->estimateTableSizes) },
 		{ PGCOPYDB_SNAPSHOT, ENV_TYPE_STRING,
@@ -657,6 +660,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "defer-indexes", no_argument, NULL, 257 },
 		{ "defer-analyze", no_argument, NULL, 258 },
 		{ "defer-validate-fks", no_argument, NULL, 259 },
+		{ "copy-groups", required_argument, NULL, 260 },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -1156,6 +1160,18 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.deferValidateFKs = true;
 				log_trace("--defer-validate-fks");
+				break;
+			}
+
+			case 260:
+			{
+				if (!stringToInt(optarg, &options.copyGroups) ||
+					options.copyGroups < 1)
+				{
+					log_fatal("Failed to parse --copy-groups: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--copy-groups %d", options.copyGroups);
 				break;
 			}
 

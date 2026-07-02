@@ -13,6 +13,7 @@
      --large-objects-jobs          Number of concurrent Large Objects jobs to run
      --split-tables-larger-than    Same-table concurrency size threshold
      --split-max-parts             Maximum number of jobs for Same-table concurrency 
+     --copy-groups                 Number of sequential table groups to copy under separate snapshots
      --estimate-table-sizes        Allow using estimates for relation sizes
      --drop-if-exists              On the target database, clean-up from a previous run first
      --roles                       Also copy roles found on source to target

@@ -56,6 +56,7 @@ typedef struct CopyDBOptions
 
 	SplitTableLargerThan splitTablesLargerThan;
 	int splitMaxParts;
+	int copyGroups;
 	bool estimateTableSizes;
 
 	RestoreOptions restoreOptions;

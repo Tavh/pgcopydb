@@ -469,6 +469,7 @@ typedef struct LogicalStreamClient
 	char cdcPathDir[MAXPGPATH];
 
 	char slotName[NAMEDATALEN];
+	bool temporary;             /* create a TEMPORARY slot (auto-drops on close) */
 
 	StreamOutputPlugin plugin;
 	KeyVal pluginOptions;

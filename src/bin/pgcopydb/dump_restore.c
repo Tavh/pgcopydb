@@ -538,6 +538,22 @@ copydb_append_table_hook(void *ctx, SourceTable *table)
  * copydb_target_finalize_schema finalizes the schema after all the data has
  * been copied over, and after indexes and their constraints have been created
  * too.
+ *
+ * The post-data finalize work is split into two independently-callable phases:
+ *
+ *   1. copydb_target_finalize_schema_indexes builds the deferred indexes (incl.
+ *      primary keys / replica identity) and restores the rest of the post-data
+ *      section (triggers, rules, ...) EXCEPT foreign-key constraints, which are
+ *      filtered out of the pg_restore list and handled separately.
+ *
+ *   2. copydb_target_finalize_schema_constraints creates the foreign-key
+ *      constraints (with the NOT VALID + retry path) and runs the extension
+ *      post-restore step.
+ *
+ * Today both phases always run back-to-back here, preserving the original
+ * behavior exactly. The split exists so a future caller can interleave other
+ * work (e.g. enabling CDC apply, driving groups to a common LSN) between the
+ * index phase and the FK-constraint phase.
  */
 bool
 copydb_target_finalize_schema(CopyDataSpec *specs)
@@ -562,6 +578,44 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 		/* errors have already been logged */
 		return false;
 	}
+
+	if (!copydb_target_finalize_schema_indexes(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!copydb_target_finalize_schema_constraints(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!summary_stop_timing(sourceDB, TIMING_SECTION_FINALIZE_SCHEMA))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_target_finalize_schema_indexes is the index phase of the post-data
+ * finalize step. It builds the deferred indexes (incl. primary keys / replica
+ * identity, which CDC apply needs for UPDATE/DELETE row lookups) when
+ * --defer-indexes --follow was used, then restores the post-data section of the
+ * dump EXCEPT foreign-key constraints (those are filtered out of the restore
+ * list and created by copydb_target_finalize_schema_constraints).
+ *
+ * This is a behavior-preserving extraction from copydb_target_finalize_schema;
+ * the summary FINALIZE_SCHEMA timing bracket stays in the caller.
+ */
+bool
+copydb_target_finalize_schema_indexes(CopyDataSpec *specs)
+{
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
 	/*
 	 * When --defer-indexes --follow was used, STEP 6 was skipped in the
@@ -642,11 +696,29 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 		return false;
 	}
 
+	return true;
+}
+
+
+/*
+ * copydb_target_finalize_schema_constraints is the foreign-key-constraint phase
+ * of the post-data finalize step. It creates the FK constraints directly (with
+ * automatic NOT VALID retry on pre-existing data violations) and then runs the
+ * extension post-restore step.
+ *
+ * This is a behavior-preserving extraction from copydb_target_finalize_schema;
+ * the summary FINALIZE_SCHEMA timing bracket stays in the caller. It must run
+ * after copydb_target_finalize_schema_indexes, which restores the post-data
+ * section minus FK constraints.
+ */
+bool
+copydb_target_finalize_schema_constraints(CopyDataSpec *specs)
+{
 	/*
 	 * Create FK constraints directly. FK CONSTRAINT entries were filtered
-	 * out of the pg_restore list above; pgcopydb handles them here with
-	 * automatic NOT VALID retry when pre-existing data violations are
-	 * found (SQLSTATE 23503).
+	 * out of the pg_restore list in the index phase; pgcopydb handles them
+	 * here with automatic NOT VALID retry when pre-existing data violations
+	 * are found (SQLSTATE 23503).
 	 */
 	if (!copydb_create_fk_constraints(specs))
 	{
@@ -661,12 +733,6 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 	{
 		log_error("Failed to call pg_restore preparation steps for extensions, "
 				  "see above for details");
-		return false;
-	}
-
-	if (!summary_stop_timing(sourceDB, TIMING_SECTION_FINALIZE_SCHEMA))
-	{
-		/* errors have already been logged */
 		return false;
 	}
 

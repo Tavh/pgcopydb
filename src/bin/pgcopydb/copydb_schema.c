@@ -175,6 +175,19 @@ copydb_fetch_schema_and_prepare_specs(CopyDataSpec *specs)
 		return false;
 	}
 
+	/*
+	 * Assign every table to one of the requested copy groups and persist the
+	 * mapping in s_table_group_assignment. At --copy-groups 1 (the default)
+	 * every table maps to group 0, which is a no-op with respect to copy
+	 * behavior.
+	 */
+	if (!catalog_compute_table_group_assignment(&(specs->catalogs.source),
+												specs->copyGroups))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return true;
 }
 

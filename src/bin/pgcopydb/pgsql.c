@@ -3819,8 +3819,9 @@ pgsql_create_logical_replication_slot(LogicalStreamClient *client,
 	char query[BUFSIZE] = { 0 };
 
 	sformat(query, sizeof(query),
-			"CREATE_REPLICATION_SLOT \"%s\" LOGICAL \"%s\"",
+			"CREATE_REPLICATION_SLOT \"%s\" %sLOGICAL \"%s\"",
 			client->slotName,
+			client->temporary ? "TEMPORARY " : "",
 			OutputPluginToString(client->plugin));
 
 	if (!pgsql_open_connection(pgsql))

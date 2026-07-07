@@ -625,6 +625,111 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 
 
 /*
+ * copydb_export_snapshot_temp_slot creates a throwaway logical replication slot
+ * SOLELY to obtain an exact (snapshot, consistent_point LSN) pair for a copy
+ * group's COPY, in the --copy-groups single-stream design. The one permanent
+ * CDC slot (group 0) supplies the change stream for every group; a group g's
+ * only unique need is its consistent point LSN_g, used as an apply threshold.
+ *
+ * Unlike copydb_create_logical_replication_slot this does NOT write the
+ * snapshot/slot resume files (those belong to the permanent slot) and does NOT
+ * touch any catalog. The caller COPYies group g under copySpecs->sourceSnapshot,
+ * records slot->lsn as the group's threshold, then calls copydb_drop_temp_slot
+ * to release the snapshot (advancing the source xmin horizon) and drop the slot
+ * (letting the source reclaim retained WAL) before the next group.
+ */
+bool
+copydb_export_snapshot_temp_slot(CopyDataSpec *copySpecs,
+								 const char *slotName,
+								 StreamOutputPlugin plugin,
+								 ReplicationSlot *slot)
+{
+	TransactionSnapshot *sourceSnapshot = &(copySpecs->sourceSnapshot);
+
+	sourceSnapshot->kind = SNAPSHOT_KIND_LOGICAL;
+
+	LogicalStreamClient *stream = &(sourceSnapshot->stream);
+
+	strlcpy(slot->slotName, slotName, sizeof(slot->slotName));
+	slot->plugin = plugin;
+
+	if (!pgsql_init_stream(stream,
+						   copySpecs->connStrings.logrep_pguri,
+						   plugin,
+						   slot->slotName,
+						   InvalidXLogRecPtr,
+						   InvalidXLogRecPtr))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Create a PostgreSQL TEMPORARY slot: it is automatically dropped when this
+	 * walsender connection (held on sourceSnapshot->stream for the duration of
+	 * the group's copy) closes — whether we drop it cleanly via
+	 * copydb_drop_temp_slot, or the process fails / is killed. That guarantees
+	 * the throwaway slot never leaks and never retains WAL beyond its group's
+	 * copy, even on a crash, without any external cleanup registration.
+	 */
+	stream->temporary = true;
+
+	if (!pgsql_create_logical_replication_slot(stream, slot))
+	{
+		log_error("Failed to create temporary replication slot \"%s\" "
+				  "for a copy group snapshot", slotName);
+		return false;
+	}
+
+	strlcpy(sourceSnapshot->snapshot, slot->snapshot,
+			sizeof(sourceSnapshot->snapshot));
+	sourceSnapshot->state = SNAPSHOT_STATE_EXPORTED;
+	sourceSnapshot->exportedCreateSlotSnapshot = true;
+
+	return true;
+}
+
+
+/*
+ * copydb_drop_temp_slot releases a copy group's temporary snapshot slot created
+ * by copydb_export_snapshot_temp_slot: it finishes the walsender connection that
+ * holds the exported snapshot (releasing the data xmin so the horizon advances)
+ * and drops the now-unused slot (so the source reclaims the WAL it retained).
+ */
+bool
+copydb_drop_temp_slot(CopyDataSpec *copySpecs, const char *slotName)
+{
+	TransactionSnapshot *sourceSnapshot = &(copySpecs->sourceSnapshot);
+
+	/* release the exported snapshot by closing the walsender connection */
+	(void) pgsql_finish(&(sourceSnapshot->stream.pgsql));
+	sourceSnapshot->state = SNAPSHOT_STATE_CLOSED;
+
+	/* drop the slot so the source can reclaim the WAL it was retaining */
+	PGSQL pgsql = { 0 };
+
+	if (!pgsql_init(&pgsql,
+					copySpecs->connStrings.source_pguri,
+					PGSQL_CONN_SOURCE))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!pgsql_drop_replication_slot(&pgsql, slotName))
+	{
+		log_error("Failed to drop temporary replication slot \"%s\"", slotName);
+		(void) pgsql_finish(&pgsql);
+		return false;
+	}
+
+	(void) pgsql_finish(&pgsql);
+
+	return true;
+}
+
+
+/*
  * snapshot_write_slot writes a replication slot information to file.
  */
 bool

@@ -15,9 +15,12 @@ all: pagila pagila-multi-steps blobs unit filtering filtering-standby extensions
 	 follow-wal2json follow-standby follow-9.6 follow-data-only follow-target-reconnect \
 	 endpos-in-multi-wal-txn exclude-extension \
 	 blob-snapshot-release follow-defer-indexes fk-not-valid defer-validate-fks \
-	 follow-defer-validate-fks;
+	 follow-defer-validate-fks copy-groups-cdc;
 
 pagila: build
+	$(MAKE) -C $@
+
+copy-groups-cdc: build
 	$(MAKE) -C $@
 
 pagila-multi-steps: build
@@ -102,4 +105,4 @@ build:
 .PHONY: follow-wal2json follow-standby follow-9.6 follow-target-reconnect
 .PHONY: endpos-in-multi-wal-txn exclude-extension
 .PHONY: blob-snapshot-release follow-defer-indexes fk-not-valid defer-validate-fks
-.PHONY: follow-defer-validate-fks
+.PHONY: follow-defer-validate-fks copy-groups-cdc

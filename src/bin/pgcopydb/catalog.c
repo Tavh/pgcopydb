@@ -107,6 +107,16 @@ static char *sourceDBcreateDDLs[] = {
 
 	"create unique index s_ts_oid on s_table_size(oid)",
 
+	"create table s_table_group_assignment("
+	"  oid integer primary key references s_table(oid), "
+	"  group_number integer "
+	")",
+
+	"create table s_group_lsn("
+	"  group_number integer primary key, "
+	"  threshold_lsn pg_lsn "
+	")",
+
 	"create table s_attr("
 	"  oid integer references s_table(oid), "
 	"  attnum integer, attypid integer, attname text, "
@@ -326,6 +336,16 @@ static char *filterDBcreateDDLs[] = {
 	")",
 
 	"create unique index s_ts_oid on s_table_size(oid)",
+
+	"create table s_table_group_assignment("
+	"  oid integer primary key references s_table(oid), "
+	"  group_number integer "
+	")",
+
+	"create table s_group_lsn("
+	"  group_number integer primary key, "
+	"  threshold_lsn pg_lsn "
+	")",
 
 	"create table s_attr("
 	"  oid integer references s_table(oid), "
@@ -739,8 +759,20 @@ catalog_register_setup_from_specs(CopyDataSpec *copySpecs)
 			return false;
 		}
 
-		/* skip comparing snapshots when --not-consistent is used */
-		if (copySpecs->consistent)
+		/*
+		 * Skip comparing snapshots when --not-consistent is used.
+		 *
+		 * Also skip it under --copy-groups N (N > 1): each copy group runs
+		 * under its OWN exported snapshot (group 0's was recorded in this
+		 * shared catalog at setup time, while groups 1..N-1 each export a
+		 * distinct snapshot so the source xmin horizon can advance between
+		 * groups). A per-group copy child therefore legitimately operates with
+		 * a snapshot different from the one stored in the shared catalog, so
+		 * the equality check does not apply. The per-group isolation that
+		 * matters (sentinel/slot/origin) lives in each group's own
+		 * "source-g%d.db", not in this shared schema catalog.
+		 */
+		if (copySpecs->consistent && copySpecs->copyGroups <= 1)
 		{
 			if (!streq(copySpecs->sourceSnapshot.snapshot, setup->snapshot))
 			{
@@ -1178,7 +1210,8 @@ catalog_create_schema(DatabaseCatalog *catalog)
 		case DATABASE_CATALOG_TYPE_SOURCE:
 		{
 			createDDLs = sourceDBcreateDDLs;
-			count = sizeof(sourceDBcreateDDLs) / sizeof(sourceDBcreateDDLs[0]);
+			count = sizeof(sourceDBcreateDDLs) /
+					sizeof(sourceDBcreateDDLs[0]);
 			break;
 		}
 
@@ -3371,6 +3404,434 @@ catalog_add_s_table_size(DatabaseCatalog *catalog,
 	}
 
 	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_add_s_table_group_assignment records that the table identified by oid
+ * belongs to the given copy group (group_number, zero-based). It mirrors the
+ * catalog_add_s_table_size accessor pattern.
+ */
+bool
+catalog_add_s_table_group_assignment(DatabaseCatalog *catalog,
+									 uint32_t oid,
+									 int groupNumber)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_table_group_assignment: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into s_table_group_assignment(oid, group_number) "
+		"values($1, $2)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "group_number", groupNumber, NULL },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * Context used while binning tables into copy groups. Tables are visited in
+ * decreasing-size order (catalog_iter_s_table orders by ts.bytes desc), so the
+ * very first table is the largest and gets its own group (group 0). The
+ * remaining tables are greedily packed into groups 1..groupCount-1, always
+ * assigning the next (smaller) table to the currently lightest group.
+ */
+typedef struct TableGroupAssignContext
+{
+	DatabaseCatalog *catalog;
+	int groupCount;
+	bool firstTable;
+	int64_t *groupBytes;        /* running total per group, length groupCount */
+} TableGroupAssignContext;
+
+
+/*
+ * catalog_compute_table_group_assignment_hook is the per-table callback used by
+ * catalog_compute_table_group_assignment.
+ */
+static bool
+catalog_compute_table_group_assignment_hook(void *ctx, SourceTable *table)
+{
+	TableGroupAssignContext *context = (TableGroupAssignContext *) ctx;
+
+	int group = 0;
+
+	if (context->groupCount <= 1)
+	{
+		/* N=1: everything maps to group 0 (no-op, today's behavior) */
+		group = 0;
+	}
+	else if (context->firstTable)
+	{
+		/* the largest table is alone in group 0 */
+		group = 0;
+		context->firstTable = false;
+	}
+	else
+	{
+		/*
+		 * Greedy bin-packing of the remaining tables across groups 1 ..
+		 * groupCount-1: pick the lightest group so far.
+		 */
+		group = 1;
+
+		for (int g = 2; g < context->groupCount; g++)
+		{
+			if (context->groupBytes[g] < context->groupBytes[group])
+			{
+				group = g;
+			}
+		}
+	}
+
+	context->groupBytes[group] += table->bytes;
+
+	if (!catalog_add_s_table_group_assignment(context->catalog,
+											  table->oid,
+											  group))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_compute_table_group_assignment assigns every table in the catalog to
+ * one of groupCount copy groups and persists the assignment in the
+ * s_table_group_assignment companion table. At groupCount == 1 every table is
+ * placed in group 0, which is a no-op with respect to copy behavior.
+ */
+bool
+catalog_compute_table_group_assignment(DatabaseCatalog *catalog, int groupCount)
+{
+	/*
+	 * Some command paths (e.g. pgcopydb list) reuse the schema fetch without
+	 * setting --copy-groups; treat an unset/zero count as the default single
+	 * group so the assignment stays a no-op.
+	 */
+	if (groupCount < 1)
+	{
+		groupCount = DEFAULT_COPY_GROUPS;
+	}
+
+	TableGroupAssignContext context = {
+		.catalog = catalog,
+		.groupCount = groupCount,
+		.firstTable = true,
+		.groupBytes = (int64_t *) calloc(groupCount, sizeof(int64_t))
+	};
+
+	if (context.groupBytes == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (!catalog_iter_s_table(catalog,
+							  &context,
+							  &catalog_compute_table_group_assignment_hook))
+	{
+		/* errors have already been logged */
+		free(context.groupBytes);
+		return false;
+	}
+
+	free(context.groupBytes);
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_s_table_group_number_fetch is the SQLiteQuery callback used by
+ * catalog_lookup_s_table_group_number. It stores the looked-up group number
+ * into the int the context points at.
+ */
+static bool
+catalog_lookup_s_table_group_number_fetch(SQLiteQuery *query)
+{
+	int *groupNumber = (int *) query->context;
+
+	*groupNumber = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_s_table_group_number returns the copy group a table is
+ * assigned to in the s_table_group_assignment companion table (see
+ * catalog_compute_table_group_assignment). A table that has no row (which only
+ * happens when no assignment was computed, e.g. at the single-group default)
+ * is reported as group 0.
+ */
+bool
+catalog_lookup_s_table_group_number(DatabaseCatalog *catalog,
+									uint32_t oid,
+									int *groupNumber)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_s_table_group_number: db is NULL");
+		return false;
+	}
+
+	/* default to group 0 when no assignment row exists */
+	*groupNumber = 0;
+
+	char *sql =
+		"select group_number from s_table_group_assignment where oid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = groupNumber,
+		.fetchFunction = &catalog_lookup_s_table_group_number_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL }
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* the query returns at most one row; zero rows leaves *groupNumber at 0 */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_set_group_lsn records a copy group's threshold LSN (the consistent
+ * point at which that group's tables were COPYied). The single-stream apply
+ * uses it to decide, per change, whether the change predates the group's copy
+ * (already captured, skip) or postdates it (apply): a change to a table in
+ * group g is applied iff its transaction commit LSN > threshold_lsn(g).
+ *
+ * Stored as pg_lsn text ("%X/%X"), mirroring the sentinel LSN columns.
+ */
+bool
+catalog_set_group_lsn(DatabaseCatalog *catalog, int groupNumber, uint64_t lsn)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_set_group_lsn: db is NULL");
+		return false;
+	}
+
+	char lsnStr[PG_LSN_MAXLENGTH] = { 0 };
+	sformat(lsnStr, sizeof(lsnStr), "%X/%X", LSN_FORMAT_ARGS(lsn));
+
+	char *sql =
+		"insert or replace into s_group_lsn(group_number, threshold_lsn) "
+		"values($1, $2)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "group_number", groupNumber, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "threshold_lsn", 0, (char *) lsnStr },
+	};
+
+	if (!catalog_sql_bind(&query, params, sizeof(params) / sizeof(params[0])))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_group_lsn_fetch is the SQLiteQuery callback used by
+ * catalog_lookup_group_lsn. It parses the pg_lsn text into the uint64 the
+ * context points at.
+ */
+static bool
+catalog_lookup_group_lsn_fetch(SQLiteQuery *query)
+{
+	uint64_t *lsn = (uint64_t *) query->context;
+
+	if (sqlite3_column_type(query->ppStmt, 0) == SQLITE_NULL)
+	{
+		return true;
+	}
+
+	const char *lsnStr = (const char *) sqlite3_column_text(query->ppStmt, 0);
+
+	if (lsnStr != NULL && !parseLSN((char *) lsnStr, lsn))
+	{
+		log_error("Failed to parse group threshold LSN \"%s\"", lsnStr);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_group_lsn returns a copy group's threshold LSN (see
+ * catalog_set_group_lsn). When no row exists for the group the threshold is
+ * reported as InvalidXLogRecPtr (0), which makes the apply filter apply every
+ * change for that group (no filtering) — the safe default for group 0 and for
+ * the single-group (N=1) case where no group LSN is ever recorded.
+ */
+bool
+catalog_lookup_group_lsn(DatabaseCatalog *catalog, int groupNumber,
+						 uint64_t *lsn)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_group_lsn: db is NULL");
+		return false;
+	}
+
+	/* default to InvalidXLogRecPtr when no row exists */
+	*lsn = InvalidXLogRecPtr;
+
+	char *sql =
+		"select threshold_lsn from s_group_lsn where group_number = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = lsn,
+		.fetchFunction = &catalog_lookup_group_lsn_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT, "group_number", groupNumber, NULL }
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
 	if (!catalog_sql_execute_once(&query))
 	{
 		/* errors have already been logged */

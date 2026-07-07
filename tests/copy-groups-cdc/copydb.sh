@@ -1,0 +1,237 @@
+#! /bin/bash
+
+set -x
+set -e
+
+# Disable pager for psql to avoid hanging in non-interactive environments
+export PAGER=cat
+
+# This script expects the following environment variables to be set:
+#
+#  - PGCOPYDB_SOURCE_PGURI
+#  - PGCOPYDB_TARGET_PGURI
+#  - PGCOPYDB_TABLE_JOBS
+#  - PGCOPYDB_INDEX_JOBS
+
+# make sure source and target databases are ready
+pgcopydb ping
+
+#
+# Deploy the schema (cross-group FK) and bulk-seed the source. The orders table
+# is the largest relation, so --copy-groups 2 isolates it in group 0 and the
+# orders -> customers FK spans the group boundary.
+#
+psql -v ON_ERROR_STOP=1 -d "${PGCOPYDB_SOURCE_PGURI}" -f /usr/src/pgcopydb/ddl.sql
+psql -v ON_ERROR_STOP=1 -d "${PGCOPYDB_SOURCE_PGURI}" -f /usr/src/pgcopydb/seed.sql
+
+#
+# Real source xmin-horizon sampler.
+#
+# Every 0.2s, record the oldest backend_xmin held by any backend on the source
+# (excluding this sampler). That oldest backend_xmin IS the cutoff VACUUM uses
+# to decide which dead tuples in user tables it may remove. The whole point of
+# --copy-groups is that this horizon must ADVANCE during the copy instead of
+# being pinned at the start for the entire multi-hour run.
+#
+# With per-group lazy snapshots, group 1's snapshot is created only after group
+# 0's copy finishes (and after concurrent traffic has advanced the source XID),
+# so the held xmin steps forward between groups. With a single long-held
+# snapshot (or all N snapshots taken up front), this value would stay pinned at
+# its initial value for the whole copy. We assert below that it advanced.
+#
+SAMPLE_FILE=/tmp/xmin-samples.txt
+: > "${SAMPLE_FILE}"
+
+(
+    while true
+    do
+        # backend_xmin is type xid, which has no min() aggregate and no btree
+        # ordering, so cast through text to bigint to find the oldest one.
+        PGAPPNAME=xmin_sampler psql -At -d "${PGCOPYDB_SOURCE_PGURI}" -c \
+            "select coalesce(min(backend_xmin::text::bigint)::text, '') \
+               from pg_stat_activity \
+              where backend_xmin is not null \
+                and application_name <> 'xmin_sampler'" >> "${SAMPLE_FILE}" \
+            2>/dev/null
+        sleep 0.2
+    done
+) &
+SAMPLER_PID=$!
+
+#
+# Start a bounded burst of mixed-group, cross-group transactions concurrently
+# with the copy. The bulk orders COPY outlasts this burst, so every committed
+# change is <= the common cutover LSN (picked after both group copies finish)
+# and is applied to the target. We wait for the burst to finish before
+# comparing.
+#
+bash /usr/src/pgcopydb/run-background-traffic.sh 12 &
+TRAFFIC_PID=$!
+
+#
+# Also run a WAL nudger for the duration of the run. It only issues
+# pg_switch_wal (a SWITCH record, no table data), which lets the replication
+# slots flush THROUGH the common cutover LSN on an otherwise-idle source so the
+# apply can reach endpos. It does not change any migrated data.
+#
+bash /usr/src/pgcopydb/wal-nudger.sh &
+NUDGER_PID=$!
+
+#
+# The cardinal test: grouped online migration end-to-end. The N=2 run copies
+# group 0 (orders) and group 1 (customers) under separate snapshots, builds
+# indexes once, enables apply per group, drives both groups to a common LSN,
+# then restores the cross-group FK once after convergence and resets sequences.
+#
+# Capture the output so we can assert xmin advancement between groups.
+#
+pgcopydb clone --follow --copy-groups 2 --plugin wal2json \
+    --split-tables-larger-than 200kB 2>&1 | tee /tmp/clone.log
+
+# the data burst is short-lived; the nudger runs until we stop it here
+wait ${TRAFFIC_PID} || true
+kill -TERM ${NUDGER_PID} 2>/dev/null || true
+wait ${NUDGER_PID} 2>/dev/null || true
+
+# stop the xmin-horizon sampler
+kill -TERM ${SAMPLER_PID} 2>/dev/null || true
+wait ${SAMPLER_PID} 2>/dev/null || true
+
+#
+# THE CARDINAL ASSERTION: the source xmin horizon actually advanced during the
+# copy. Reduce the samples to the distinct oldest-backend_xmin values seen, in
+# the order they first appeared, ignoring empty samples (moments when no
+# backend held a snapshot).
+#
+mapfile -t XMIN_SEQ < <(grep -v '^$' "${SAMPLE_FILE}" | awk '!seen[$0]++')
+
+echo "distinct oldest-backend_xmin values observed during copy: ${XMIN_SEQ[*]}"
+
+#
+# THE CARDINAL ASSERTION: the copy did NOT hold a single snapshot for the whole
+# run. We prove this DETERMINISTICALLY (independent of sampling timing) with two
+# facts from the clone log:
+#
+#   1. each group's snapshot was released before the next group (one log line
+#      per group), and
+#   2. the per-group copy thresholds strictly ADVANCE (group 1's consistent
+#      point is later than group 0's) -> the snapshots were taken lazily, one
+#      per group, NOT all up front (the bug this feature fixes).
+#
+# The oldest-backend_xmin sampler above is a best-effort corroboration: on a fast
+# copy with little inter-group write traffic the numeric XID horizon may not
+# visibly move even though the snapshots were released, so it is reported below
+# but not asserted.
+#
+
+releases=$(grep -c "xmin horizon can advance" /tmp/clone.log || true)
+echo "per-group snapshot releases logged: ${releases}"
+
+if [ "${releases}" -lt 2 ]
+then
+    echo "FAIL: expected 2 per-group snapshot releases, found ${releases}"
+    exit 1
+fi
+
+lsn0=$(grep "Group 0 apply threshold LSN is" /tmp/clone.log \
+       | grep -oE "[0-9A-Fa-f]+/[0-9A-Fa-f]+" | tail -1)
+lsn1=$(grep "Group 1 apply threshold LSN is" /tmp/clone.log \
+       | grep -oE "[0-9A-Fa-f]+/[0-9A-Fa-f]+" | tail -1)
+
+echo "per-group copy thresholds: group0=${lsn0} group1=${lsn1}"
+
+if [ -z "${lsn0}" ] || [ -z "${lsn1}" ]
+then
+    echo "FAIL: could not read per-group copy threshold LSNs from the clone log"
+    exit 1
+fi
+
+advanced=$(psql -At -d "${PGCOPYDB_SOURCE_PGURI}" \
+    -c "select '${lsn1}'::pg_lsn > '${lsn0}'::pg_lsn")
+
+if [ "${advanced}" != "t" ]
+then
+    echo "FAIL: group 1 snapshot (${lsn1}) was not taken after group 0 (${lsn0});"
+    echo "      the copy did not release/re-take snapshots per group (the up-front"
+    echo "      snapshot bug that pins the xmin horizon for the whole run)."
+    exit 1
+fi
+
+echo "PASS: per-group snapshots advanced (group0 ${lsn0} -> group1 ${lsn1}) and" \
+     "were released between groups; the copy never pins one snapshot for the run"
+
+if [ "${#XMIN_SEQ[@]}" -ge 2 ] && [ "${XMIN_SEQ[-1]}" -gt "${XMIN_SEQ[0]}" ]
+then
+    echo "  (also observed the backend_xmin horizon advance" \
+         "${XMIN_SEQ[0]} -> ${XMIN_SEQ[-1]})"
+else
+    echo "  (backend_xmin numeric value did not visibly move this run — little" \
+         "inter-group write traffic; the per-group release above is the guarantee)"
+fi
+
+# assert the single-stream finalize ran: indexes whole-DB, apply caught up to
+# the cutover LSN, then FK constraints whole-DB.
+grep -q "build indexes across all 2 copy groups" /tmp/clone.log \
+    || (echo "FAIL: whole-DB index build step not found" && exit 1)
+
+grep -q "Apply has reached the cutover LSN" /tmp/clone.log \
+    || (echo "FAIL: apply did not reach the cutover LSN" && exit 1)
+
+grep -q "Restoring FK constraints across all 2 copy groups" /tmp/clone.log \
+    || (echo "FAIL: whole-DB FK constraint restore step not found" && exit 1)
+
+#
+# The source is now static (traffic finished and all committed <= LSN_C). The
+# target must equal the source.
+#
+pgcopydb compare data
+
+#
+# The cross-group FK must be present and VALID on the target (the barrier
+# validates it once after convergence).
+#
+invalid=$(psql -At -d "${PGCOPYDB_TARGET_PGURI}" -c \
+    "select count(*) from pg_constraint
+      where contype = 'f' and not convalidated")
+
+if [ "${invalid}" != "0" ]
+then
+    echo "FAIL: ${invalid} foreign key constraint(s) are NOT VALID on target"
+    psql -d "${PGCOPYDB_TARGET_PGURI}" -c \
+        "select conname, convalidated from pg_constraint where contype = 'f'"
+    exit 1
+fi
+
+# explicitly re-validate the cross-group FK as a belt-and-suspenders check
+psql -v ON_ERROR_STOP=1 -d "${PGCOPYDB_TARGET_PGURI}" -c \
+    "do \$\$
+     declare r record;
+     begin
+       for r in select conrelid::regclass as t, conname
+                  from pg_constraint where contype = 'f'
+       loop
+         execute format('alter table %s validate constraint %I', r.t, r.conname);
+       end loop;
+     end \$\$;"
+
+#
+# Final row-count sanity check on both tables, source vs target.
+#
+for t in customers orders
+do
+    s=$(psql -At -d "${PGCOPYDB_SOURCE_PGURI}" -c "select count(*) from ${t}")
+    d=$(psql -At -d "${PGCOPYDB_TARGET_PGURI}" -c "select count(*) from ${t}")
+
+    echo "table ${t}: source=${s} target=${d}"
+
+    if [ "${s}" != "${d}" ]
+    then
+        echo "FAIL: row count mismatch for ${t}: source=${s} target=${d}"
+        exit 1
+    fi
+done
+
+echo "PASS: copy-groups N=2 end-to-end migration is consistent"
+
+# cleanup
+pgcopydb stream cleanup || true

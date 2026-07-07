@@ -256,6 +256,16 @@ typedef struct CopyDataSpec
 
 	SplitTableLargerThan splitTablesLargerThan;
 	int splitMaxParts;
+	int copyGroups;
+
+	/*
+	 * currentCopyGroup is the copy group the COPY phase is currently working
+	 * on. It only matters when copyGroups > 1: the COPY worker queue iterator
+	 * then enqueues only the tables assigned to this group (a second, internal
+	 * filter layered on top of the user's filters.ini scope). At the
+	 * single-group default it stays 0 and is never consulted.
+	 */
+	int currentCopyGroup;
 	bool estimateTableSizes;
 
 	Queue copyQueue;
@@ -339,6 +349,13 @@ bool copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 											const char *logrep_pguri,
 											ReplicationSlot *slot);
 
+bool copydb_export_snapshot_temp_slot(CopyDataSpec *copySpecs,
+									  const char *slotName,
+									  StreamOutputPlugin plugin,
+									  ReplicationSlot *slot);
+
+bool copydb_drop_temp_slot(CopyDataSpec *copySpecs, const char *slotName);
+
 bool snapshot_write_slot(const char *filename, ReplicationSlot *slot);
 bool snapshot_read_slot(const char *filename, ReplicationSlot *slot);
 
@@ -400,6 +417,8 @@ bool copydb_target_prepare_schema(CopyDataSpec *specs);
 bool copydb_copy_database_properties(CopyDataSpec *specs);
 bool copydb_target_drop_tables(CopyDataSpec *specs);
 bool copydb_target_finalize_schema(CopyDataSpec *specs);
+bool copydb_target_finalize_schema_indexes(CopyDataSpec *specs);
+bool copydb_target_finalize_schema_constraints(CopyDataSpec *specs);
 
 bool copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
 												ArchiveContentItem *item);

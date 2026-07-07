@@ -284,6 +284,23 @@ bool catalog_add_s_table_chksum(DatabaseCatalog *catalog,
 bool catalog_add_s_table_size(DatabaseCatalog *catalog,
 							  SourceTableSize *tableSize);
 
+bool catalog_add_s_table_group_assignment(DatabaseCatalog *catalog,
+										  uint32_t oid,
+										  int groupNumber);
+
+bool catalog_compute_table_group_assignment(DatabaseCatalog *catalog,
+											int groupCount);
+
+bool catalog_lookup_s_table_group_number(DatabaseCatalog *catalog,
+										 uint32_t oid,
+										 int *groupNumber);
+
+bool catalog_set_group_lsn(DatabaseCatalog *catalog, int groupNumber,
+						   uint64_t lsn);
+
+bool catalog_lookup_group_lsn(DatabaseCatalog *catalog, int groupNumber,
+							  uint64_t *lsn);
+
 bool catalog_delete_s_table_chksum_all(DatabaseCatalog *catalog);
 
 /*

@@ -92,6 +92,15 @@ typedef struct LogicalMessageMetadata
 	bool filterOut;
 	bool skipping;
 
+	/*
+	 * Table this statement targets, when known at parse time (TRUNCATE, and the
+	 * PREPARE of INSERT/UPDATE/DELETE). Used by the --copy-groups apply threshold
+	 * for actions applied directly from the SQL file (e.g. TRUNCATE) that have no
+	 * PreparedStmt to carry the name.
+	 */
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+
 	/* the statement part of a PREPARE dseadbeef AS ... */
 	char *stmt;
 
@@ -411,6 +420,14 @@ typedef struct StreamContext
 
 	bool transactionInProgress;
 	bool pipelineBroken;        /* EPIPE on stdout, downstream process died */
+
+	/*
+	 * --copy-groups N: when > 1, the transform pre-writes the commit-LSN
+	 * metadata file for continued (multi-WAL-segment) transactions so the apply
+	 * can resolve their commit LSN at BEGIN for the per-group threshold filter.
+	 * Inert at <= 1 (N=1 transform behavior is byte-for-byte unchanged).
+	 */
+	int copyGroups;
 } StreamContext;
 
 
@@ -428,6 +445,23 @@ typedef struct PreparedStmt
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } PreparedStmt;
+
+
+/*
+ * --copy-groups apply threshold cache. Maps a table (nspname.relname) to its
+ * copy group and that group's threshold LSN_g (the consistent point at which the
+ * group was COPYied). Cached on the StreamApplyContext so it survives across
+ * transactions (PreparedStmt entries are freed every COMMIT), so the catalog
+ * lookup happens at most once per table for the whole apply run.
+ */
+typedef struct GroupThresholdEntry
+{
+	char key[2 * PG_NAMEDATALEN + 1];   /* "nspname.relname" */
+	int groupNumber;
+	uint64_t thresholdLSN;
+
+	UT_hash_handle hh;
+} GroupThresholdEntry;
 
 
 /*
@@ -490,6 +524,19 @@ typedef struct StreamApplyContext
 
 	SourceFilters *filters;     /* table filtering configuration */
 
+	/*
+	 * --copy-groups N: the real number of copy groups. When copyGroups > 1 the
+	 * apply enforces the per-group commit-LSN threshold (a change to a group-g
+	 * table is applied iff its transaction committed strictly after LSN_g).
+	 * currentTxnCommitLSN is the commit LSN of the transaction currently being
+	 * applied, captured at BEGIN. Both inert at copyGroups <= 1.
+	 */
+	int copyGroups;
+	uint64_t currentTxnCommitLSN;
+
+	/* --copy-groups per-table threshold cache (see GroupThresholdEntry) */
+	GroupThresholdEntry *groupThresholdCache;
+
 	uint64_t pipelineBytes;     /* accumulated bytes in pipeline buffer */
 } StreamApplyContext;
 
@@ -537,6 +584,14 @@ struct StreamSpecs
 	KeyVal pluginOptions;
 
 	char origin[NAMEDATALEN];
+
+	/*
+	 * --copy-groups N: the real number of copy groups, carried to the apply
+	 * context to gate the per-group commit-LSN threshold filter. The CDC stream
+	 * itself is always single; this is only the filter's on/off + N. Inert at
+	 * copyGroups <= 1.
+	 */
+	int copyGroups;
 
 	uint64_t startpos;
 	uint64_t endpos;
@@ -771,6 +826,8 @@ bool computeSQLFileName(StreamApplyContext *context);
 
 bool parseSQLAction(const char *query, LogicalMessageMetadata *metadata,
 					SourceFilters *filters);
+
+bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir);
 
 bool stream_apply_find_durable_lsn(StreamApplyContext *context,
 								   uint64_t *durableLSN);

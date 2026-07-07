@@ -597,6 +597,34 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 	CopyDataSpec *specs = context->specs;
 	PGSQL *dst = context->dst;
 
+	/*
+	 * When copying in more than one group (--copy-groups N), each group copies
+	 * only its own subset of the in-scope tables, under its own snapshot. This
+	 * is a second, internal filter layered on top of the user's filters.ini
+	 * scope (already applied while building the s_table catalog): we simply skip
+	 * enqueueing any table whose group assignment is not the group currently
+	 * being copied. At the single-group default (copyGroups <= 1) this check is
+	 * bypassed entirely, so the queue is filled exactly as before.
+	 */
+	if (specs->copyGroups > 1)
+	{
+		int groupNumber = 0;
+
+		if (!catalog_lookup_s_table_group_number(&(specs->catalogs.source),
+												 table->oid,
+												 &groupNumber))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (groupNumber != specs->currentCopyGroup)
+		{
+			/* this table belongs to a different copy group, skip it */
+			return true;
+		}
+	}
+
 	if (table->partition.partCount == 0)
 	{
 		if (!copydb_add_copy(specs, table->oid, 0))

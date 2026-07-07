@@ -139,6 +139,7 @@ jobs:
           - filtering
           - filtering-standby
           - extensions
+          - exclude-extension
           # - timescaledb  # temporarily disabled: failing due to an upstream timescaledb issue
           - skip-publications
           - skip-vacuum
@@ -159,6 +160,7 @@ jobs:
           - fk-not-valid
           - defer-validate-fks
           - follow-defer-validate-fks
+          - copy-groups-cdc
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6

@@ -413,6 +413,7 @@ stream_init_context(StreamSpecs *specs)
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	privateContext->sourceDB = specs->sourceDB;
+	privateContext->filters = specs->filters;
 
 	return true;
 }

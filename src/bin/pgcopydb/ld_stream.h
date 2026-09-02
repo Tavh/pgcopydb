@@ -245,6 +245,7 @@ typedef struct LogicalTransaction
 	bool continued;
 	bool commit;
 	bool rollback;
+	bool hasFilteredStatement;
 
 	uint32_t count;                     /* number of statements */
 	LogicalTransactionStatement *first;

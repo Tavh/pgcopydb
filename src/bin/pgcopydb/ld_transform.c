@@ -1495,6 +1495,14 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				}
 			}
 
+			if (metadata->filterOut)
+			{
+				txn->hasFilteredStatement = true;
+				free(stmt);
+				privateContext->stmt = NULL;
+				break;
+			}
+
 			/* skip DML targeting materialized views */
 			const char *stmtNspname = NULL;
 			const char *stmtRelname = NULL;

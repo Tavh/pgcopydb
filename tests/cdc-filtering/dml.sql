@@ -28,5 +28,13 @@ INSERT INTO excluded_schema.test_table (data) VALUES
 
 UPDATE excluded_schema.test_table SET data = 'updated but should not appear' WHERE id = 1;
 
+-- Cross a WAL boundary inside one mixed transaction. The filtered statement
+-- must not remove the BEGIN needed by the included statement after the switch.
+BEGIN;
+UPDATE excluded_schema.test_table SET data = 'filtered before WAL switch' WHERE id = 1;
+SELECT pg_switch_wal();
+UPDATE public.users SET email = 'charlie.boundary@example.com' WHERE username = 'charlie';
+COMMIT;
+
 -- More public changes (should be applied)
 UPDATE public.users SET username = 'robert' WHERE username = 'bob';

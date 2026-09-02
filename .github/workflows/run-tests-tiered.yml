@@ -120,7 +120,7 @@ jobs:
   integration_tests:
     name: Integration (${{ matrix.TEST }}, PG ${{ matrix.PGVERSION }})
     runs-on: ubuntu-latest
-    needs: [smoke_tests]
+    needs: [style_checker, banned_api_checker]
     strategy:
       fail-fast: false  # Continue running other tests even if one fails
       matrix:

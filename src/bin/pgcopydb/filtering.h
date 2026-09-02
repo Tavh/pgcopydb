@@ -98,6 +98,8 @@ typedef struct SourceFilters
 char * filterTypeToString(SourceFilterType type);
 SourceFilterType filterTypeComplement(SourceFilterType type);
 bool parse_filters(const char *filebname, SourceFilters *filters);
+bool shouldFilterOutTable(const char *nspname, const char *relname,
+						  SourceFilters *filters);
 
 bool filters_as_json(SourceFilters *filters, JSON_Value *jsFilter);
 bool filters_from_json(const char *jsonString, SourceFilters *filters);

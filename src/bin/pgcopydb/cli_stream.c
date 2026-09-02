@@ -1196,6 +1196,22 @@ stream_start_in_mode(LogicalStreamMode mode)
 	}
 
 	/*
+	 * Load the saved filtering setup before prefetch starts its transform
+	 * process. Follow-up stream commands do not receive --filters again.
+	 */
+	if (!catalog_open_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!catalog_register_setup_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
 	 * Refrain from logging SQL statements in the apply module, because they
 	 * contain user data. That said, when --trace has been used, bypass that
 	 * privacy feature.

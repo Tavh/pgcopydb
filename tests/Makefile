@@ -11,7 +11,7 @@ export DOCKER
 BUILD_ARGS = --build-arg PGVERSION=$(PGVERSION)
 
 all: pagila pagila-multi-steps blobs unit filtering extensions \
-	 cdc-wal2json cdc-test-decoding cdc-endpos-between-transaction cdc-low-level \
+	 cdc-wal2json cdc-test-decoding cdc-filtering cdc-endpos-between-transaction cdc-low-level \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 endpos-in-multi-wal-txn;
 
@@ -42,6 +42,9 @@ cdc-wal2json: build
 cdc-test-decoding: build
 	$(MAKE) -C $@
 
+cdc-filtering: build
+	$(MAKE) -C $@
+
 cdc-endpos-between-transaction: build
 	$(MAKE) -C $@
 
@@ -69,6 +72,6 @@ build:
 
 .PHONY: all build
 .PHONY: pagila pagila-multi-steps blobs unit filtering extensions
-.PHONY: cdc-wal2json cdc-test-decoding cdc-low-level
+.PHONY: cdc-wal2json cdc-test-decoding cdc-filtering cdc-low-level
 .PHONY: follow-wal2json follow-9.6
 .PHONY: endpos-in-multi-wal-txn

@@ -239,6 +239,24 @@ parseTestDecodingMessage(StreamContext *privateContext,
 		return false;
 	}
 
+	/*
+	 * test_decoding emits changes for every table. Apply explicit filters
+	 * before parsing tuples because excluded tables are absent from our source
+	 * catalog by design.
+	 */
+	if (shouldFilterOutTable(header.table.nspname,
+							 header.table.relname,
+							 privateContext->filters))
+	{
+		log_debug("Skipping filtered %c for table %s",
+				  metadata->action,
+				  header.qname);
+		free(header.table.nspname);
+		free(header.table.relname);
+		metadata->filterOut = true;
+		return true;
+	}
+
 	switch (metadata->action)
 	{
 		case STREAM_ACTION_BEGIN:

@@ -1414,6 +1414,14 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				}
 			}
 
+			if (metadata->filterOut)
+			{
+				txn->hasFilteredStatement = true;
+				free(stmt);
+				privateContext->stmt = NULL;
+				break;
+			}
+
 			(void) streamLogicalTransactionAppendStatement(txn, stmt);
 
 			break;
@@ -1789,6 +1797,20 @@ stream_write_transaction(FILE *out, LogicalTransaction *txn)
 	 */
 	bool sentBEGIN = false;
 	bool splitTx = false;
+
+	/*
+	 * A filtered statement still belongs to the source transaction. Emit its
+	 * BEGIN before a possible WAL switch so that later continued parts retain
+	 * the original transaction boundary.
+	 */
+	if (txn->hasFilteredStatement && !txn->continued)
+	{
+		if (!stream_write_begin(out, txn))
+		{
+			return false;
+		}
+		sentBEGIN = true;
+	}
 
 	LogicalTransactionStatement *currentStmt = txn->first;
 

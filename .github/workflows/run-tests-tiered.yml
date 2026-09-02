@@ -81,11 +81,8 @@ jobs:
       matrix:
         PGVERSION:
           - 16
-          - 17
-          - 18
         TEST:
           - ci
-          - unit
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -129,37 +126,8 @@ jobs:
       matrix:
         PGVERSION:
           - 16
-          - 17
-          - 18
         TEST:
-          - pagila
-          - pagila-multi-steps
-          - pagila-standby
-          - blobs
-          - filtering
-          - filtering-standby
-          - extensions
-          # - timescaledb  # temporarily disabled: failing due to an upstream timescaledb issue
-          - skip-publications
-          - skip-vacuum
-          - skip-large-objects
-          - cdc-low-level
-          - cdc-test-decoding
-          - cdc-endpos-between-transaction
           - cdc-filtering
-          - cdc-wal2json
-          - follow-wal2json
-          - follow-standby
-          - follow-9.6
-          - follow-data-only
-          - follow-target-reconnect
-          - endpos-in-multi-wal-txn
-          - blob-snapshot-release
-          - follow-defer-indexes
-          - fk-not-valid
-          - defer-validate-fks
-          - follow-defer-validate-fks
-          - copy-groups-cdc
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6

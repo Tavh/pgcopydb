@@ -29,6 +29,14 @@
 #define STREAM_RECONNECT_MAX_SLEEP_SECS 30
 #define STREAM_RECONNECT_MAX_TOTAL_SECS 600
 
+/*
+ * The receive process creates the stream context files only after logical
+ * replication has started. Transform and apply must therefore wait for the
+ * receiver's entire reconnect window, including its final backoff sleep.
+ */
+#define STREAM_CONTEXT_MAX_WAIT_SECS \
+	(STREAM_RECONNECT_MAX_TOTAL_SECS + STREAM_RECONNECT_MAX_SLEEP_SECS)
+
 #define PREPARE "PREPARE "
 #define EXECUTE "EXECUTE "
 #define TRUNCATE "TRUNCATE "

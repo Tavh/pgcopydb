@@ -2836,7 +2836,7 @@ stream_read_context(StreamSpecs *specs)
 	 */
 	ConnectionRetryPolicy retryPolicy = { 0 };
 
-	int maxT = 10;              /* 10s */
+	int maxT = STREAM_CONTEXT_MAX_WAIT_SECS;
 	int maxSleepTime = 1500;    /* 1.5s */
 	int baseSleepTime = 100;    /* 100ms */
 
@@ -2890,7 +2890,9 @@ stream_read_context(StreamSpecs *specs)
 	if (!(file_exists(paths->walsegsizefile) &&
 		  file_exists(paths->tlifile)))
 	{
-		log_error("Failed to read stream context file: retry policy expired");
+		log_error("Logical replication receiver did not create stream context "
+				  "files within %d seconds",
+				  STREAM_CONTEXT_MAX_WAIT_SECS);
 		return false;
 	}
 

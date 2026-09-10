@@ -10,7 +10,7 @@
 
 /* pgsql_timeline.c */
 bool pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system,
-						   char *cdcPathDir);
+						   char *cdcPathDir, bool fetchTimelineHistory);
 bool parse_timeline_history_file(char *filename,
 								 DatabaseCatalog *catalog,
 								 uint32_t currentTimeline);

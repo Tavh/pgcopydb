@@ -2782,12 +2782,34 @@ stream_write_context(StreamSpecs *specs, LogicalStreamClient *stream)
 
 	/* read from the timeline history file and populate internal catalogs */
 	if (stream->system.timeline > 1 &&
+		stream->system.timelineHistoryFilename[0] != '\0' &&
 		!parse_timeline_history_file(stream->system.timelineHistoryFilename,
 									 specs->sourceDB,
 									 stream->system.timeline))
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	/*
+	 * Managed PostgreSQL services may reject TIMELINE_HISTORY on a logical
+	 * replication connection. In that case, register the current timeline from
+	 * IDENTIFY_SYSTEM; CDC only needs its ID for the current stream filenames.
+	 */
+	if (stream->system.timeline > 1 &&
+		stream->system.timelineHistoryFilename[0] == '\0')
+	{
+		TimelineHistoryEntry entry = {
+			.tli = stream->system.timeline,
+			.begin = InvalidXLogRecPtr,
+			.end = InvalidXLogRecPtr
+		};
+
+		if (!catalog_add_timeline_history(specs->sourceDB, &entry))
+		{
+			log_error("Failed to add current timeline entry to catalog");
+			return false;
+		}
 	}
 
 	return true;

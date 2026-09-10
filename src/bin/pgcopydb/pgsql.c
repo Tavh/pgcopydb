@@ -4063,7 +4063,10 @@ pgsql_start_replication(LogicalStreamClient *client)
 	}
 
 	/* fetch the source timeline */
-	if (!pgsql_identify_system(pgsql, &(client->system), client->cdcPathDir))
+	if (!pgsql_identify_system(pgsql,
+							   &(client->system),
+							   client->cdcPathDir,
+							   false))
 	{
 		/* errors have already been logged */
 		destroyPQExpBuffer(query);

@@ -36,11 +36,13 @@ static bool register_timeline_hook(void *ctx, char *line);
 
 /*
  * pgsql_identify_system connects to the given pgsql client and issue the
- * replication command IDENTIFY_SYSTEM. The pgsql connection string should
- * contain the 'replication=1' parameter.
+ * replication command IDENTIFY_SYSTEM. TIMELINE_HISTORY is a physical
+ * replication command, so callers using a logical replication connection must
+ * set fetchTimelineHistory to false.
  */
 bool
-pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir)
+pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir,
+					  bool fetchTimelineHistory)
 {
 	bool connIsOurs = pgsql->connection == NULL;
 
@@ -84,8 +86,8 @@ pgsql_identify_system(PGSQL *pgsql, IdentifySystem *system, char *cdcPathDir)
 		return false;
 	}
 
-	/* while at it, we also run the TIMELINE_HISTORY command */
-	if (system->timeline > 1)
+	/* while at it, fetch physical timeline history when the caller supports it */
+	if (fetchTimelineHistory && system->timeline > 1)
 	{
 		TimelineHistoryResult hContext = { 0 };
 
